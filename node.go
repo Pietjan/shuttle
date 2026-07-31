@@ -1,0 +1,354 @@
+package shuttle
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"sync"
+
+	"github.com/a-h/templ"
+	"github.com/pietjan/loom"
+)
+
+// node is one mounted component instance: its own state, its own action
+// table, its own morph target, its own children.
+//
+// The per-node action table is what makes a scoped re-render possible. A
+// session-wide table would be replaced wholesale on every render, so a
+// child re-rendering would invalidate every action its parent had just
+// handed the client.
+type node struct {
+	sess   *Session
+	parent *node
+	path   path
+	key    string
+	cmp    Component
+
+	mu sync.Mutex
+	// gen counts this node's renders, and is part of every action id it
+	// hands out, so a click against markup a morph has replaced runs the
+	// closure it was rendered for rather than whatever now sits in that
+	// position.
+	gen       uint64
+	cur, prev map[string]Action
+
+	// children are keyed by the caller's key; order fixes each key's path
+	// index so a child keeps its ids when its siblings come and go.
+	children map[string]*node
+	order    map[string]int
+	next     int
+
+	// cleanup stops what this component started - subscriptions, timers,
+	// presence - when it is unmounted. On the session rather than the node
+	// it would outlive the component: a child's timer would keep firing
+	// after its key stopped being rendered, pushing renders at a node that
+	// no longer exists.
+	cleanup []func()
+}
+
+// onClose registers teardown to run when this component is unmounted.
+func (n *node) onClose(fn func()) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.cleanup = append(n.cleanup, fn)
+}
+
+func newNode(sess *Session, parent *node, p path, key string, cmp Component) *node {
+	n := &node{
+		sess:     sess,
+		parent:   parent,
+		path:     p,
+		key:      key,
+		cmp:      cmp,
+		cur:      map[string]Action{},
+		prev:     map[string]Action{},
+		children: map[string]*node{},
+		order:    map[string]int{},
+	}
+	if b, ok := cmp.(binder); ok {
+		b.bind(n)
+	}
+	return n
+}
+
+// render renders this component into its wrapper and installs the action
+// table its markup refers to.
+//
+// The two steps belong together: bindings register themselves while the
+// tree is being built, so a table is only correct for the markup produced
+// by the same pass.
+func (n *node) render(ctx context.Context) (string, error) {
+	n.mu.Lock()
+	n.gen++
+	sc := &scope{node: n, gen: n.gen, table: map[string]Action{}, seen: map[string]bool{}}
+	n.mu.Unlock()
+
+	// A fresh Loom ID counter per node, so a component rendered on its own
+	// produces the ids it had inside the page.
+	rctx := withScope(loom.NewContext(ctx), sc)
+
+	// The body renders into its own buffer, so a component that fails
+	// halfway does not leave half its markup in the patch.
+	body, err := n.renderBody(rctx)
+	if err != nil {
+		fb, ok := n.cmp.(Fallback)
+		if !ok {
+			return "", err
+		}
+		// The boundary: one component's failure costs that component, not
+		// the page. A fallback that also fails is not worth a second chance.
+		body, err = renderSafely(rctx, fb.RenderError(rctx, err))
+		if err != nil {
+			return "", err
+		}
+	}
+
+	// After the body, because the body is what says which indicators this
+	// render used - and before it in the output, which is the point.
+	var buf bytes.Buffer
+	if err := n.writeRoot(&buf, sc); err != nil {
+		return "", err
+	}
+	buf.WriteString(body)
+	buf.WriteString(`</div>`)
+
+	n.mu.Lock()
+	n.prev, n.cur = n.cur, sc.table
+	n.mu.Unlock()
+
+	// A child the parent stopped rendering is gone: unmount it rather than
+	// leaving its state, and its action table, alive for the session.
+	n.prune(ctx, sc.seen)
+
+	return buf.String(), nil
+}
+
+// renderBody renders the component itself, without its wrapper.
+func (n *node) renderBody(ctx context.Context) (string, error) {
+	c, err := build(ctx, n.cmp)
+	if err != nil {
+		return "", err
+	}
+	return renderSafely(ctx, c)
+}
+
+// build calls Render, turning a panic into an error.
+func build(ctx context.Context, cmp Component) (c templ.Component, err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			c, err = nil, fmt.Errorf("%w: Render: %v", ErrPanic, v)
+		}
+	}()
+	return cmp.Render(ctx), nil
+}
+
+// renderSafely renders a component to a string, turning a panic into an
+// error. templ components run arbitrary application code, so a panic here
+// is a bug in a component rather than in the framework - but it must not
+// take the session's goroutine with it.
+func renderSafely(ctx context.Context, c templ.Component) (s string, err error) {
+	if c == nil {
+		return "", nil
+	}
+	defer func() {
+		if v := recover(); v != nil {
+			s, err = "", fmt.Errorf("%w: rendering: %v", ErrPanic, v)
+		}
+	}()
+
+	var buf bytes.Buffer
+	if err := c.Render(ctx, &buf); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
+// writeRoot opens the component's wrapper: its morph target, and where its
+// signals are declared.
+func (n *node) writeRoot(buf *bytes.Buffer, sc *scope) error {
+	attrs := ""
+	if sig, ok := n.cmp.(Signaller); ok {
+		var err error
+		if attrs, err = signalAttrs(n.path.namespace(), sig.Signals()); err != nil {
+			return err
+		}
+	}
+	attrs += sc.indicatorDecls()
+
+	buf.WriteString(`<div id="`)
+	buf.WriteString(n.path.elementID())
+	buf.WriteString(`" data-shuttle="component"`)
+	buf.WriteString(attrs)
+	buf.WriteString(`>`)
+	return nil
+}
+
+// push marks this component for re-render on the session's goroutine.
+//
+// Only this component's subtree: an event on a child must not re-render its
+// parent, which is the whole point of tracking dirtiness per component
+// rather than per page.
+//
+// It marks rather than renders so that it is safe to call from any
+// goroutine, and so that ten pushes in a row cost one render.
+func (n *node) push(context.Context) error {
+	return n.sess.markDirty(n)
+}
+
+// lookup finds a registered action, falling back to the previous render's
+// table so a click already in flight when the morph landed still resolves.
+func (n *node) lookup(actionID string) (Action, bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	fn, ok := n.cur[actionID]
+	if !ok {
+		fn, ok = n.prev[actionID]
+	}
+	return fn, ok
+}
+
+// child returns the instance mounted under key, creating it on first sight.
+//
+// The key is the identity rule, and it is the whole rule: the same key
+// keeps the same instance and its state across the parent's re-renders, and
+// a different key is a different component that mounts fresh. factory runs
+// only on that first mount, so props captured in it are mount-time props -
+// a parent wanting to update a live child holds a reference and sets its
+// fields, which costs nothing when the child is a Go struct in the same
+// process.
+func (n *node) child(ctx context.Context, key string, factory func() Component) (*node, error) {
+	n.mu.Lock()
+	if c, ok := n.children[key]; ok {
+		n.mu.Unlock()
+		return c, nil
+	}
+
+	idx, ok := n.order[key]
+	if !ok {
+		n.next++
+		idx = n.next
+		n.order[key] = idx
+	}
+	c := newNode(n.sess, n, n.path.child(idx), key, factory())
+	n.children[key] = c
+	n.mu.Unlock()
+
+	n.sess.register(c)
+
+	drop := func() {
+		n.sess.unregister(c)
+		n.mu.Lock()
+		delete(n.children, key)
+		n.mu.Unlock()
+	}
+
+	if m, ok := c.cmp.(Mounter); ok {
+		if err := m.Mount(ctx, n.sess.Params()); err != nil {
+			drop()
+			return nil, err
+		}
+	}
+	// A child sees the URL too. Without this a component whose state comes
+	// from its parameters - a table reading its filter and page - would work
+	// as a root and quietly render nothing as a child.
+	if h, ok := c.cmp.(ParamsHandler); ok {
+		if err := h.HandleParams(ctx, n.sess.Params()); err != nil {
+			drop()
+			return nil, err
+		}
+	}
+	return c, nil
+}
+
+// prune unmounts children the latest render did not include.
+func (n *node) prune(ctx context.Context, seen map[string]bool) {
+	n.mu.Lock()
+	var gone []*node
+	for key, c := range n.children {
+		if !seen[key] {
+			gone = append(gone, c)
+			delete(n.children, key)
+		}
+	}
+	n.mu.Unlock()
+
+	for _, c := range gone {
+		c.close(ctx)
+	}
+}
+
+// close unmounts this component and everything below it.
+func (n *node) close(ctx context.Context) {
+	n.mu.Lock()
+	children := make([]*node, 0, len(n.children))
+	for _, c := range n.children {
+		children = append(children, c)
+	}
+	n.children = map[string]*node{}
+	cleanup := n.cleanup
+	n.cleanup = nil
+	n.mu.Unlock()
+
+	for _, c := range children {
+		c.close(ctx)
+	}
+
+	// Subscriptions and timers first: neither should be able to deliver
+	// into a component that is being unmounted.
+	for i := len(cleanup) - 1; i >= 0; i-- {
+		cleanup[i]()
+	}
+
+	n.sess.unregister(n)
+	if u, ok := n.cmp.(Unmounter); ok {
+		u.Unmount(ctx)
+	}
+}
+
+// walk visits this node and every node below it.
+func (n *node) walk(fn func(*node)) {
+	fn(n)
+	n.mu.Lock()
+	children := make([]*node, 0, len(n.children))
+	for _, c := range n.children {
+		children = append(children, c)
+	}
+	n.mu.Unlock()
+
+	for _, c := range children {
+		c.walk(fn)
+	}
+}
+
+// Child mounts a component under the parent's key and renders it in place.
+//
+//	shuttle.Child(ctx, item.ID, func() shuttle.Component {
+//	    return &Row{Item: item}
+//	})
+//
+// The child gets its own state, its own action table and its own morph
+// target, so an event on it re-renders it alone. See [node.child] for the
+// identity rule the key sets.
+func Child(ctx context.Context, key string, factory func() Component) templ.Component {
+	sc, ok := scopeFrom(ctx)
+	if !ok {
+		return templ.NopComponent
+	}
+	parent := sc.node
+
+	return templ.ComponentFunc(func(rctx context.Context, w io.Writer) error {
+		child, err := parent.child(rctx, key, factory)
+		if err != nil {
+			return err
+		}
+		sc.saw(key)
+
+		html, err := child.render(rctx)
+		if err != nil {
+			return err
+		}
+		_, err = io.WriteString(w, html)
+		return err
+	})
+}

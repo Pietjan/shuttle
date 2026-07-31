@@ -1,0 +1,68 @@
+# golangci-lint v2 configuration
+# See https://golangci-lint.run/docs/configuration/file/
+version: "2"
+
+run:
+  timeout: 5m
+  allow-parallel-runners: true
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - bodyclose
+    - errname
+    - err113
+    - errorlint
+    - goconst
+    - gocyclo
+    - gosec
+    - misspell
+    - nolintlint
+    - revive
+    - unconvert
+    - unparam
+
+  settings:
+    revive:
+      confidence: 0.8
+
+  exclusions:
+    rules:
+      - linters:
+          - errcheck
+          - goconst
+          - gocyclo
+          - gosec
+          # A test's failure is read by a person, not matched on by a caller.
+          - err113
+        path: _test\.go
+      # The examples are programs that report to a human and exit: their
+      # errors reach log.Fatal, never a caller, so sentinels to match on
+      # would be noise. They also serve files from paths the developer
+      # passed on the command line, which is not untrusted input.
+      #
+      # goconst and unparam are excluded for a different reason: an example
+      # exists to be read. Hoisting "core" into a constant would hide the
+      # demo data behind an indirection, and the hooks it implements -
+      # Mount, HandleInfo, HandleEvent - return an error because the
+      # interface says so, not because this one has anything to report.
+      - linters:
+          - err113
+          - goconst
+          - gosec
+          - unparam
+        path: example/
+      # newSession is the test-only constructor; production goes through
+      # newSessionWith, so its id parameter only ever sees a literal here.
+      - linters:
+          - unparam
+        text: newSession
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
