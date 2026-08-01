@@ -47,12 +47,35 @@ type Queryer interface {
 // Navigate changes the page's URL and pushes a history entry, without
 // reloading. The component stays mounted and its [ParamsHandler] runs, so
 // this is the "patch" case: same view, different parameters.
+//
+// # Call this from component code
+//
+// It runs [ParamsHandler.HandleParams] on every component in the tree
+// before returning, on whatever goroutine calls it - and HandleParams
+// writes component fields, which the session renders from. So an action, a
+// HandleInfo, a Mount or a [Base.Do] closure is fine, and anything else
+// races the session's own goroutine:
+//
+//	// from a background goroutine, an HTTP handler, anywhere else
+//	cmp.Do(func(ctx context.Context) error {
+//	    return cmp.Navigate(ctx, "/results")
+//	})
+//
+// Running it inline rather than queueing it is deliberate: queued, the
+// action that called it would finish and re-render with the old parameters
+// before HandleParams ran, so the page would show stale content for a frame
+// and take two patches to settle. The error would be lost as well - a
+// queued call has nowhere to return one. [Base.Redirect] has neither
+// constraint, because it only sends a script.
 func (b *Base) Navigate(ctx context.Context, rawURL string) error {
 	return b.history(ctx, "pushState", rawURL, true)
 }
 
 // Replace changes the page's URL without adding a history entry, so the
 // back button skips it. Right for a filter the user is still adjusting.
+//
+// Call it from component code, for the reason [Base.Navigate] explains: it
+// runs HandleParams on the calling goroutine.
 func (b *Base) Replace(ctx context.Context, rawURL string) error {
 	return b.history(ctx, "replaceState", rawURL, true)
 }
@@ -60,6 +83,10 @@ func (b *Base) Replace(ctx context.Context, rawURL string) error {
 // Redirect leaves for another URL with a full page load, throwing this
 // session away. Use it when the destination is not this component - a
 // login page, another app.
+//
+// Unlike [Base.Navigate] and [Base.Replace] this is safe to call from any
+// goroutine: the page is leaving, so there is no HandleParams to run and
+// nothing to do but send a script.
 func (b *Base) Redirect(_ context.Context, rawURL string) error {
 	if b.n == nil {
 		return ErrNotMounted

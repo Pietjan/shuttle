@@ -200,6 +200,11 @@ func (b *Base) Push(ctx context.Context) error {
 // Emit sends an event to the nearest ancestor that implements [Receiver],
 // and re-renders that ancestor. This is how a child talks back to its
 // parent without either holding a reference to the other.
+//
+// Call it from component code. Like [Base.Navigate] it runs the other
+// component's handler - [Receiver.HandleEvent] - on the calling goroutine,
+// so from anywhere else it races the session. Wrap it in [Base.Do] if you
+// are not already inside a callback.
 func (b *Base) Emit(ctx context.Context, name string, payload any) error {
 	if b.n == nil {
 		return ErrNotMounted

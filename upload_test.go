@@ -19,11 +19,21 @@ import (
 	"github.com/pietjan/loom/input"
 )
 
+// peHeader is the start of a Windows executable: enough control bytes that
+// http.DetectContentType calls it application/octet-stream rather than
+// text.
+const peHeader = "MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00"
+
+// pngHeader is a real PNG signature.
+const pngHeader = "\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+
 // gallery accepts images.
 type gallery struct {
 	Base
 	Received []string
 	Sizes    []int64
+	Types    []string
+	Declared []string
 	Saved    string
 	dir      string
 }
@@ -44,6 +54,8 @@ func (g *gallery) HandleUpload(_ context.Context, name string, files []*Uploaded
 	for _, f := range files {
 		g.Received = append(g.Received, f.Name)
 		g.Sizes = append(g.Sizes, f.Size)
+		g.Types = append(g.Types, f.Type)
+		g.Declared = append(g.Declared, f.DeclaredType)
 
 		if g.dir != "" {
 			path, err := f.Save(g.dir)
@@ -69,7 +81,7 @@ func (g *gallery) Render(ctx context.Context) templ.Component {
 }
 
 // upload posts files the way the shim's XHR does.
-func upload(t *testing.T, srv *httptest.Server, path string, files ...[3]string) (int, string) {
+func upload(t *testing.T, srv *httptest.Server, sid, path string, files ...[3]string) (int, string) {
 	t.Helper()
 
 	var body bytes.Buffer
@@ -97,6 +109,7 @@ func upload(t *testing.T, srv *httptest.Server, path string, files ...[3]string)
 		t.Fatalf("upload request: %v", err)
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set(SessionHeader, sid)
 
 	resp, err := srv.Client().Do(req)
 	if err != nil {
@@ -132,7 +145,7 @@ func TestFileInputRendersTheWiring(t *testing.T) {
 		`id="shuttle-c-upload-photos"`,
 		`accept="image/png,text/*"`,
 		`multiple`, // MaxFiles is 2
-		"/_shuttle/upload/test/c/photos",
+		"/_shuttle/upload/c/photos",
 	} {
 		if !strings.Contains(markup, want) {
 			t.Errorf("missing %q in %q", want, markup)
@@ -169,7 +182,7 @@ func TestUploadRoundTrip(t *testing.T) {
 	stream := openStream(t, srv, sid)
 	url := uploadURL(t, fragment(t, page))
 
-	code, body := upload(t, srv, url, [3]string{"a.png", "image/png", "png bytes"})
+	code, body := upload(t, srv, sid, url, [3]string{"a.png", "image/png", "png bytes"})
 	if code != http.StatusNoContent {
 		t.Fatalf("upload: status %d (%s)", code, body)
 	}
@@ -205,10 +218,10 @@ func TestUploadedFilesAreCleanedUp(t *testing.T) {
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
-	page, _ := getPage(t, srv)
+	page, sid := getPage(t, srv)
 	url := uploadURL(t, fragment(t, page))
 
-	if code, body := upload(t, srv, url, [3]string{"a.txt", "text/plain", "hello"}); code != http.StatusNoContent {
+	if code, body := upload(t, srv, sid, url, [3]string{"a.txt", "text/plain", "hello"}); code != http.StatusNoContent {
 		t.Fatalf("upload: status %d (%s)", code, body)
 	}
 
@@ -237,6 +250,94 @@ func (k *keeper) Render(ctx context.Context) templ.Component {
 	return input.New(FileInput(ctx, input.Attr, "doc"))
 }
 
+// TestUploadTypeIsCheckedAgainstTheBytes. The content type in a multipart
+// part is a string the client writes, so checking it would pass an
+// executable that called itself image/png. What is checked is the file.
+func TestUploadTypeIsCheckedAgainstTheBytes(t *testing.T) {
+	c := &gallery{}
+	h := New(func() Component { return c })
+	h.Logger = quietLogger()
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	page, sid := getPage(t, srv)
+	url := uploadURL(t, fragment(t, page))
+
+	// Declared as a type the component accepts. The bytes say otherwise.
+	code, body := upload(t, srv, sid, url, [3]string{"payload.png", "image/png", peHeader})
+	if code != http.StatusBadRequest {
+		t.Errorf("an executable labelled image/png: status %d, want 400", code)
+	}
+	if !strings.Contains(body, ErrFileType.Error()) {
+		t.Errorf("refusal does not say why: %q", body)
+	}
+	if len(c.Received) != 0 {
+		t.Errorf("it reached the component anyway: %v", c.Received)
+	}
+
+	// The other direction: a real PNG the client mislabelled, which the old
+	// check would have refused for being honest about not knowing.
+	code, body = upload(t, srv, sid, url,
+		[3]string{"real.png", "application/octet-stream", pngHeader})
+	if code != http.StatusNoContent {
+		t.Fatalf("a real png labelled octet-stream: status %d, want 204 (%s)", code, body)
+	}
+	if len(c.Received) != 1 {
+		t.Fatalf("the component received %v", c.Received)
+	}
+	if got := c.Types[0]; got != "image/png" {
+		t.Errorf("recorded type = %q, want the detected image/png", got)
+	}
+	if got := c.Declared[0]; got != "application/octet-stream" {
+		t.Errorf("declared type = %q, want what the client claimed", got)
+	}
+}
+
+// TestTextUploadsSurviveDetection. http.DetectContentType collapses every
+// kind of text to text/plain, so checking the bytes would refuse a csv from
+// a component that asked for csv - the one case where the declared type had
+// been carrying the check.
+func TestTextUploadsSurviveDetection(t *testing.T) {
+	c := &spreadsheet{}
+	h := New(func() Component { return c })
+	h.Logger = quietLogger()
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	page, sid := getPage(t, srv)
+	url := uploadURL(t, fragment(t, page))
+
+	if code, body := upload(t, srv, sid, url,
+		[3]string{"rows.csv", "text/csv", "a,b,c\n1,2,3\n"}); code != http.StatusNoContent {
+		t.Fatalf("a csv into a component accepting text/csv: status %d (%s)", code, body)
+	}
+	// And it is still a real check: a binary is refused.
+	if code, _ := upload(t, srv, sid, url,
+		[3]string{"rows.csv", "text/csv", peHeader}); code != http.StatusBadRequest {
+		t.Errorf("a binary called rows.csv: status %d, want 400", code)
+	}
+}
+
+// spreadsheet accepts one concrete text type, which is the shape that makes
+// detection awkward.
+type spreadsheet struct {
+	Base
+	Rows int
+}
+
+func (s *spreadsheet) Uploads() []Upload {
+	return []Upload{{Name: "rows", Accept: []string{"text/csv"}}}
+}
+
+func (s *spreadsheet) HandleUpload(context.Context, string, []*UploadedFile) error {
+	s.Rows++
+	return nil
+}
+
+func (s *spreadsheet) Render(ctx context.Context) templ.Component {
+	return input.New(FileInput(ctx, input.Attr, "rows"))
+}
+
 // TestUploadLimitsAreEnforcedServerSide. The picker was told the same
 // rules, but a client that skips them has to be refused anyway.
 func TestUploadLimitsAreEnforcedServerSide(t *testing.T) {
@@ -256,8 +357,11 @@ func TestUploadLimitsAreEnforcedServerSide(t *testing.T) {
 			},
 			want: http.StatusBadRequest,
 		},
+		// Binary rather than the string "MZ": what is checked is the
+		// content, and two printable characters are text, which this
+		// component accepts.
 		"wrong type": {
-			files: []([3]string){{"evil.exe", "application/x-msdownload", "MZ"}},
+			files: []([3]string){{"evil.exe", "application/x-msdownload", peHeader}},
 			want:  http.StatusBadRequest,
 		},
 		"nothing at all": {
@@ -272,10 +376,10 @@ func TestUploadLimitsAreEnforcedServerSide(t *testing.T) {
 			srv := httptest.NewServer(h)
 			t.Cleanup(srv.Close)
 
-			page, _ := getPage(t, srv)
+			page, sid := getPage(t, srv)
 			url := uploadURL(t, fragment(t, page))
 
-			if code, _ := upload(t, srv, url, tc.files...); code != tc.want {
+			if code, _ := upload(t, srv, sid, url, tc.files...); code != tc.want {
 				t.Errorf("status %d, want %d", code, tc.want)
 			}
 			if len(c.Received) != 0 {
@@ -323,7 +427,7 @@ func TestUploadRejectsUnknownTargets(t *testing.T) {
 		"unknown component": routePrefix + "/upload/" + sid + "/c-9/photos",
 		"unknown upload":    routePrefix + "/upload/" + sid + "/c/nope",
 	} {
-		if code, _ := upload(t, srv, path, file); code != http.StatusNotFound {
+		if code, _ := upload(t, srv, sid, path, file); code != http.StatusNotFound {
 			t.Errorf("%s: status %d, want 404", name, code)
 		}
 	}
@@ -337,10 +441,10 @@ func TestUploadNeedsAHandler(t *testing.T) {
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
-	page, _ := getPage(t, srv)
+	page, sid := getPage(t, srv)
 	url := uploadURL(t, fragment(t, page))
 
-	code, body := upload(t, srv, url, [3]string{"a.txt", "text/plain", "x"})
+	code, body := upload(t, srv, sid, url, [3]string{"a.txt", "text/plain", "x"})
 	if code != http.StatusInternalServerError {
 		t.Fatalf("status %d, want 500", code)
 	}

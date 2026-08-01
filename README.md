@@ -233,6 +233,10 @@ func (r *Room) HandleInfo(ctx context.Context, msg any) error {
 `Broker` interface has an in-memory implementation; swap in Redis or NATS for more than one node
 and nothing above it changes.
 
+A roster goes to everyone on the topic, so `Member.Tag` names a page without being the thing that
+unlocks it — attach whatever your app needs to identify someone as the `meta` argument to `Join`,
+and read it back as `Member.Meta`.
+
 For long collections, `Base.Stream` patches a container an item at a time, so the component never
 holds the collection:
 
@@ -274,6 +278,14 @@ filename first: `../../etc/passwd` is exactly what an upload endpoint gets sent.
 
 Every limit is enforced again on the server. The `accept` attribute and any client-side check are
 courtesies to the user; the client's copy of the rules is trivially skipped.
+
+`Accept` is checked against **the file's own first bytes**, not the content type the client
+declared — that one is a string an attacker writes, so checking it would let an executable through
+by calling itself an image. `UploadedFile.Type` is what was detected and `DeclaredType` is what was
+claimed. Detection is signature-based, so a container format arrives as its container: a `.docx` is
+a zip. Text is handled (any `text/*` entry accepts detected text, since everything textual detects
+as `text/plain`); for the rest there is `Upload.TrustDeclaredType`, which does what it says and
+makes `Accept` a courtesy for that upload.
 
 Progress uses `XMLHttpRequest`, because `fetch` reports none — that's the whole reason uploads need
 their own path. During an upload the input carries `data-shuttle-uploading` and
@@ -450,14 +462,22 @@ front.
   that touches component state — actions, messages, timer ticks — is serialised through one
   goroutine per session, which is why your fields need no locks. Application code coming from
   elsewhere must go through `Base.Do`.
+- **`Navigate`, `Replace` and `Emit` are covered by that rule too**, which their names do not
+  suggest. The first two run every component's `HandleParams` before returning and the third runs
+  the ancestor's `HandleEvent` — on your goroutine, writing component fields. Inside an action, a
+  `HandleInfo` or a `Mount` you are already on the session's goroutine and they are fine; from
+  anywhere else wrap them: `cmp.Do(func(ctx context.Context) error { return cmp.Navigate(ctx, u) })`.
+  `Redirect` is safe anywhere — it only sends a script.
 - **Render an `<input>`'s `value=` from committed state, not from something that moves.** The morph
   writes an attribute only when it differs: a value the server never renders leaves the typing
   alone, and one the server changes overwrites it mid-sentence.
 - **Give it a stable id** — `shuttle.ID(ctx, input.ID, "email")`. An id that changes per render
   means the element is replaced rather than morphed, which loses the typing, the focus and the
   caret. (`e2e/morph_test.go` holds all three.)
-- **A `<textarea>` is worse** — the morph compares the property and overwrites it. Shuttle has no
-  discipline for this yet.
+- **A `<textarea>` reaches the same rule by a different route.** It has no `value=` at all — the
+  content is the element's text — so the morph compares the *default* value, which is that text and
+  which typing never changes, and assigns the property when it differs. Same advice as an input:
+  render it from committed state. Both directions are covered in `e2e/morph_test.go`.
 - **Streamed items must render `id="<Stream.ItemID(key)>"`.** Shuttle checks and errors if not,
   because the alternative is an item that can never be replaced or removed.
 - **Duplicate element ids silently degrade morphing.** Datastar reports nothing at all; set
@@ -465,15 +485,65 @@ front.
 - **Signal names must be plain identifiers.** Datastar reads dots as path separators and camel-cases
   hyphens. Shuttle fails the render rather than namespacing it wrongly.
 
+## Sessions, identity and abuse
+
+**The session id is a capability.** It is 128 bits from `crypto/rand`, it is embedded in the page,
+and it is the only thing standing between a stranger and that page's actions. Two consequences
+follow, and they are why shuttle looks the way it does here.
+
+It travels in the `Shuttle-Session` header, never in a URL — a URL is the most copied string in a
+system, recorded by access logs, proxies and APM spans before your code sees it. For the same
+reason it is never logged: `Session.Tag()` is a short label minted separately from the id, so a log
+line can tell two sessions apart without naming either. Log it beside your own identifiers.
+
+And **there is no ambient credential**, which is what makes CSRF not apply: nothing is attached
+automatically by the browser, so a forged cross-site request carries no session and can do nothing.
+If you add cookie authentication of your own, do not put the session id in it — you would be
+reintroducing exactly the ambient authority this avoids. Use `SameSite=Lax` on your own cookies;
+shuttle additionally rejects a cross-origin POST outright, and `Handler.CheckOrigin` overrides that
+rule when a page is legitimately served from somewhere else.
+
+**Logging out has to reach the page.** A session outlives the request that made it, holding the
+component tree and whatever identity it captured at mount, and nothing about a cookie expiring
+reaches that:
+
+```go
+func (d *Dashboard) Mount(ctx context.Context, _ shuttle.Params) error {
+    user := auth.From(ctx)          // your middleware put it there
+    d.User = user                   // copy it: async work gets a background context
+    d.Session().SetOwner(user.ID)
+    return nil
+}
+
+// in your logout handler
+handler.CloseOwner(user.ID)         // every tab they left open
+```
+
+Closing ends the session and its stream; the page reconnects, finds nothing, and reloads — back
+through your middleware, which is now the thing saying no. `Handler.Close(sid)` does one page.
+
+**Every request a page makes draws on a per-session budget** — 10/second with a burst of 40 by
+default, `RequestRate` and `RequestBurst` to change it, a negative rate to turn it off. It refills
+continuously rather than resetting, so a page open all day is in the same position as one just
+opened, and it is checked before anything is decoded or queued. It bounds what *one page* can do to
+your database, your third-party APIs and, through pub/sub, everyone else's session. It is not a
+defence against an anonymous flood: a session id is free to anyone who loads the page, so put a
+per-IP limit in front of the page route as well.
+
+Actions carry at most `MaxSignalBytes` (64 KiB) of JSON. Internal errors never reach the client —
+the response gets the status, the log gets the cause — so read your logs when a component fails.
+
 ## What works
 
 Built and tested: sessions and transport, deterministic ids and per-instance signal namespacing,
 forms with the change/submit split, nested components with scoped re-render, pub/sub, timers,
-presence, streams, navigation with URL binding, a testing kit, connection recovery, file uploads, and the live component kit. 161 tests, race-clean, plus browser verification
-of the parts that only a browser can prove.
+presence, streams, navigation with URL binding, a testing kit, connection recovery, file uploads,
+and the live component kit. The parts only a browser can settle — the morph rules, popover
+dismissal, reconnection, upload progress — are covered by an end-to-end suite rather than by
+assertion here.
 
-Not built yet: CSRF,
-and rate limiting.
+Not built yet: per-IP rate limiting, which has to sit in front of the page route since a session
+does not exist yet at that point, and infinite scroll.
 
 Server-held state means sticky routing and memory sizing per connected tab. Plan for both before
 putting this in front of real traffic.

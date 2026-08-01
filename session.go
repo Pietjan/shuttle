@@ -17,7 +17,10 @@ import (
 // unguessable. That is what makes action ids safe to number per component
 // and per render - see [scope.register].
 type Session struct {
-	id     string
+	id string
+	// tag identifies this session in logs without being the capability that
+	// id is. See Session.Tag.
+	tag    string
 	root   *node
 	params Params
 	broker Broker
@@ -37,6 +40,19 @@ type Session struct {
 	// onError reports failures raised on the session's own goroutine, where
 	// there is no request to return them to. Set by the handler.
 	onError func(what string, err error)
+
+	// owner is an application-supplied label for whoever this page belongs
+	// to, so logging out can find their pages. It lives here rather than
+	// being read off the component because the component's fields belong to
+	// the session's goroutine, and Handler.CloseOwner is called from a
+	// request's. Guarded by mu.
+	owner string
+
+	// budget rations the requests this page may make. Guarded by mu, and
+	// held here rather than in a map keyed by session so that it is created
+	// and collected with the page it belongs to - a limiter that outlives
+	// what it limits is the leak it was added to prevent.
+	budget bucket
 
 	mu sync.Mutex
 	// nodes indexes every mounted component by its element id, so an action
@@ -83,6 +99,7 @@ func newSession(id string, cmp Component) *Session {
 func newSessionWith(id string, cmp Component, broker Broker, pres *presence, onError func(string, error)) *Session {
 	s := &Session{
 		id:      id,
+		tag:     newTag(),
 		broker:  broker,
 		pres:    pres,
 		onError: onError,
@@ -250,7 +267,52 @@ func (s *Session) fail(what string, err error) {
 // ID returns the session id. It is the client's capability for this page:
 // unguessable, and the only thing standing between a stranger and this
 // page's actions.
+//
+// Treat it the way you would a password. In particular it must never be
+// logged - use [Session.Tag] for that.
 func (s *Session) ID() string { return s.id }
+
+// Tag returns a short label identifying this session in logs.
+//
+// It exists so that telling two sessions apart does not cost writing the
+// capability to a log aggregator, an error tracker, and whatever screenshot
+// ends up attached to a bug report. It is minted independently of the id
+// rather than derived from it, so no amount of it leads back - a truncated
+// hash would still be a function of the capability, and the pressure to
+// widen it by a few characters would never have a principled answer.
+//
+// Distinguishable rather than unguessable is the whole requirement, so six
+// bytes is plenty: at the registry's cap of 10,000 live sessions the chance
+// of any collision is around one in five million.
+//
+// Log it beside your own application's identifiers to correlate a page with
+// what it did.
+func (s *Session) Tag() string { return s.tag }
+
+// SetOwner labels this session with whoever it belongs to - a user id, a
+// tenant, whatever logging out is scoped to. Call it from Mount, where the
+// request context still carries the identity your middleware put there.
+//
+// It exists because a session outlives the request that started it: the
+// component tree stays in memory with the identity it captured, pushing
+// patches down a stream, until the page goes away. Nothing about a cookie
+// expiring reaches it. [Handler.CloseOwner] is how logging out reaches it,
+// and this is what it matches on.
+//
+// A label is not a capability: it is only compared, never trusted as proof
+// of anything, so a user id is fine here.
+func (s *Session) SetOwner(owner string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.owner = owner
+}
+
+// Owner returns the label [Session.SetOwner] set, or "".
+func (s *Session) Owner() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.owner
+}
 
 // RootID returns the id of the element the root component renders into.
 func (s *Session) RootID() string { return s.root.path.elementID() }

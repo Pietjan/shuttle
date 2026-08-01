@@ -58,13 +58,14 @@ func (badSignals) Signals() map[string]any {
 	return map[string]any{"my-signal": 1}
 }
 
-func postBody(t *testing.T, srv *httptest.Server, path, body string) int {
+func postBody(t *testing.T, srv *httptest.Server, sid, path, body string) int {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, srv.URL+path, strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("action request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(SessionHeader, sid)
 	resp, err := srv.Client().Do(req)
 	if err != nil {
 		t.Fatalf("post action: %v", err)
@@ -150,7 +151,7 @@ func TestActionsUploadOnlyTheirOwnSignals(t *testing.T) {
 	// The exclude half keeps a parent from also uploading its children:
 	// filterSignals matches whole dot-paths, so /^c\./ catches c.1.query as
 	// readily as c.query.
-	if !strings.Contains(markup, `{filterSignals: {include: /^c\./, exclude: /^c\.[0-9]+\./}}`) {
+	if !strings.Contains(markup, `filterSignals: {include: /^c\./, exclude: /^c\.[0-9]+\./}`) {
 		t.Errorf("action is not scoped to the component's namespace: %q", markup)
 	}
 }
@@ -293,10 +294,10 @@ func TestSignalValuesReachTheAction(t *testing.T) {
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
-	page, _ := getPage(t, srv)
+	page, sid := getPage(t, srv)
 	url := clickURLs(t, fragment(t, page))[0]
 
-	if code := postBody(t, srv, url, `{"c":{"query":"hello","open":true}}`); code != http.StatusNoContent {
+	if code := postBody(t, srv, sid, url, `{"c":{"query":"hello","open":true}}`); code != http.StatusNoContent {
 		t.Fatalf("action: status %d, want 204", code)
 	}
 	if c.Ran != 1 {
@@ -320,11 +321,11 @@ func TestActionSeesOnlyItsOwnNamespace(t *testing.T) {
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
-	page, _ := getPage(t, srv)
+	page, sid := getPage(t, srv)
 	url := clickURLs(t, fragment(t, page))[0]
 
 	body := `{"c":{"query":"mine"},"other":{"query":"theirs"},"loose":1}`
-	if code := postBody(t, srv, url, body); code != http.StatusNoContent {
+	if code := postBody(t, srv, sid, url, body); code != http.StatusNoContent {
 		t.Fatalf("action: status %d, want 204", code)
 	}
 	if got := c.Seen["query"]; got != "mine" {
@@ -338,6 +339,78 @@ func TestActionSeesOnlyItsOwnNamespace(t *testing.T) {
 	}
 }
 
+// host renders one component as a child, so the child's signals sit a level
+// down in the payload rather than at the root of it.
+type host struct {
+	Base
+	child *search
+}
+
+func (h *host) Render(ctx context.Context) templ.Component {
+	return templ.ComponentFunc(func(ctx context.Context, w io.Writer) error {
+		return Child(ctx, "one", func() Component { return h.child }).Render(ctx, w)
+	})
+}
+
+// TestChildActionReadsItsOwnNamespace. A child's signals arrive nested under
+// its path - c.1.query, not c.query - so the server has to descend to it. A
+// component that worked as a root and silently saw nothing as somebody's
+// child is the failure this covers.
+func TestChildActionReadsItsOwnNamespace(t *testing.T) {
+	c := &search{}
+	h := New(func() Component { return &host{child: c} })
+	h.Logger = quietLogger()
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	page, sid := getPage(t, srv)
+	// The parent binds nothing, so the only click on the page is the child's.
+	url := clickURLs(t, fragment(t, page))[0]
+
+	body := `{"c":{"query":"the parent's","1":{"query":"mine"}}}`
+	if code := postBody(t, srv, sid, url, body); code != http.StatusNoContent {
+		t.Fatalf("action: status %d, want 204", code)
+	}
+	if got := c.Seen["query"]; got != "mine" {
+		t.Errorf("query = %v, want mine", got)
+	}
+	if len(c.Seen) != 1 {
+		t.Errorf("the child saw more than its own namespace: %v", c.Seen)
+	}
+}
+
+// TestPayloadsThatDoNotReachTheComponent. Signals are client-controlled, so
+// every way a payload can fail to arrive is a request the server still has
+// to answer: the action runs, and it simply sees nothing.
+func TestPayloadsThatDoNotReachTheComponent(t *testing.T) {
+	for name, body := range map[string]string{
+		"another root":       `{"other":{"query":"x"}}`,
+		"another child":      `{"c":{"2":{"query":"x"}}}`,
+		"root is not nested": `{"c":5}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := &search{}
+			h := New(func() Component { return &host{child: c} })
+			h.Logger = quietLogger()
+			srv := httptest.NewServer(h)
+			t.Cleanup(srv.Close)
+
+			page, sid := getPage(t, srv)
+			url := clickURLs(t, fragment(t, page))[0]
+
+			if code := postBody(t, srv, sid, url, body); code != http.StatusNoContent {
+				t.Fatalf("action: status %d, want 204", code)
+			}
+			if c.Ran != 1 {
+				t.Errorf("action ran %d times, want 1", c.Ran)
+			}
+			if len(c.Seen) != 0 {
+				t.Errorf("action saw signals that were not its own: %v", c.Seen)
+			}
+		})
+	}
+}
+
 // TestActionWithoutSignalsIsFine: a component declaring none posts no body,
 // which is not an error.
 func TestActionWithoutSignalsIsFine(t *testing.T) {
@@ -346,8 +419,8 @@ func TestActionWithoutSignalsIsFine(t *testing.T) {
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
-	page, _ := getPage(t, srv)
-	if code := post(t, srv, clickURLs(t, fragment(t, page))[0]); code != http.StatusNoContent {
+	page, sid := getPage(t, srv)
+	if code := post(t, srv, sid, clickURLs(t, fragment(t, page))[0]); code != http.StatusNoContent {
 		t.Errorf("action with no signals: status %d, want 204", code)
 	}
 }
@@ -419,10 +492,10 @@ func TestBadSignalPayloadIsARequestError(t *testing.T) {
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
-	page, _ := getPage(t, srv)
+	page, sid := getPage(t, srv)
 	url := clickURLs(t, fragment(t, page))[0]
 
-	if code := postBody(t, srv, url, `{not json`); code != http.StatusBadRequest {
+	if code := postBody(t, srv, sid, url, `{not json`); code != http.StatusBadRequest {
 		t.Errorf("undecodable signals: status %d, want 400", code)
 	}
 }
@@ -437,6 +510,7 @@ type indicating struct {
 
 func (i *indicating) Render(ctx context.Context) templ.Component {
 	save := button.New(
+		button.Attr("data-attr:disabled", IndicatorRef(ctx, "saving")),
 		OnClick(ctx, button.Attr, func(context.Context) error { return nil },
 			Indicator("saving")),
 	)
@@ -474,6 +548,32 @@ func TestIndicatorIsNamespacedPerInstance(t *testing.T) {
 		if !strings.Contains(markup, want) {
 			t.Errorf("missing %q in %q", want, markup)
 		}
+	}
+}
+
+// TestIndicatorRefNamesTheInstanceSignal. Writing "$ind.c.saving" by hand
+// works for a root component and silently watches the wrong signal the
+// moment the same component is mounted as a child - which is why reading
+// one is a call and not a string.
+func TestIndicatorRefNamesTheInstanceSignal(t *testing.T) {
+	sess := newSession("test", &indicating{})
+	markup, err := sess.Render(context.Background())
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+
+	for _, want := range []string{
+		`data-attr:disabled="$ind.c.saving"`,
+		`data-attr:disabled="$ind.c.1.saving"`,
+	} {
+		if !strings.Contains(markup, want) {
+			t.Errorf("missing %q in %q", want, markup)
+		}
+	}
+
+	// Outside a render there is no instance to name.
+	if got := IndicatorRef(context.Background(), "saving"); got != "" {
+		t.Errorf("IndicatorRef outside a render = %q, want empty", got)
 	}
 }
 

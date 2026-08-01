@@ -144,9 +144,9 @@ func TestChildrenGetTheirOwnIdentity(t *testing.T) {
 		`data-signals:c.1.draft__ifmissing=`,
 		`data-signals:c.2.draft__ifmissing=`,
 		// Actions name the component that owns them.
-		`/act/test/c-1/1-a1`,
-		`/act/test/c-2/1-a1`,
-		`/act/test/c/1-a1`,
+		`/act/c-1/1-a1`,
+		`/act/c-2/1-a1`,
+		`/act/c/1-a1`,
 	} {
 		if !strings.Contains(markup, want) {
 			t.Errorf("missing %q in %q", want, markup)
@@ -233,7 +233,7 @@ func TestChildActionRerendersOnlyTheChild(t *testing.T) {
 
 	// The first child's tick button.
 	url := childActionURL(t, fragment(t, page), "c-1")
-	if code := post(t, srv, url); code != http.StatusNoContent {
+	if code := post(t, srv, sid, url); code != http.StatusNoContent {
 		t.Fatalf("child action: status %d", code)
 	}
 
@@ -264,7 +264,7 @@ func TestParentActionRedrawsItsChildren(t *testing.T) {
 	sess, _ := h.sessions.get(sid)
 	rowNode(t, sess, "c-1").Ticks = 3
 
-	if code := post(t, srv, childActionURL(t, fragment(t, page), "c")); code != http.StatusNoContent {
+	if code := post(t, srv, sid, childActionURL(t, fragment(t, page), "c")); code != http.StatusNoContent {
 		t.Fatalf("parent action: status %d", code)
 	}
 
@@ -293,7 +293,7 @@ func TestEmitReachesTheNearestReceiver(t *testing.T) {
 
 	// The second child's tell button, which emits.
 	url := childActionURLs(t, fragment(t, page), "c-2")[1]
-	if code := post(t, srv, url); code != http.StatusNoContent {
+	if code := post(t, srv, sid, url); code != http.StatusNoContent {
 		t.Fatalf("emit action: status %d", code)
 	}
 
@@ -328,6 +328,16 @@ func TestEmitWithoutAReceiver(t *testing.T) {
 	r := n.cmp.(*row)
 	if err := r.Emit(ctx, "picked", "x"); !errors.Is(err, ErrNoReceiver) {
 		t.Errorf("Emit = %v, want ErrNoReceiver", err)
+	}
+}
+
+// TestEmitBeforeMount. A component built but not yet mounted has no node to
+// walk up from, so the ancestor search has nothing to search - it reports
+// rather than dereferencing a nil.
+func TestEmitBeforeMount(t *testing.T) {
+	var r row
+	if err := r.Emit(context.Background(), "picked", "x"); !errors.Is(err, ErrNotMounted) {
+		t.Errorf("Emit = %v, want ErrNotMounted", err)
 	}
 }
 
@@ -420,7 +430,7 @@ func TestChildrenSeeTheURL(t *testing.T) {
 	stream := openStream(t, srv, sid[1])
 
 	// And again when the URL changes without a remount.
-	if code := postBody(t, srv, routePrefix+"/nav/"+sid[1], `{"url":"/?filter=closed"}`); code != http.StatusNoContent {
+	if code := postBody(t, srv, sid[1], routePrefix+"/nav", `{"url":"/?filter=closed"}`); code != http.StatusNoContent {
 		t.Fatalf("nav: status %d", code)
 	}
 	if evt := stream.event(t); !strings.Contains(evt, `<span id="child-filter">closed</span>`) {

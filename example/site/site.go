@@ -20,11 +20,10 @@ import (
 // Site is the whole examples site as one component, and therefore one
 // session and one stream.
 //
-// The alternative - a handler per example with href links between them -
-// is what this used to be, and it does not survive being browsed: every
-// link is a full page load, every page holds one of the browser's ~6
-// connections per origin for its stream, and once enough are open the next
-// page simply never loads.
+// A handler per example with href links between them does not survive being
+// browsed: every link is a full page load, every page holds one of the
+// browser's ~6 connections per origin for its stream, and once enough are
+// open the next page simply never loads.
 //
 // Here a link is an action. It calls Navigate, which pushes the path into
 // history from the server and re-renders; the example being shown is a

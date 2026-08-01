@@ -160,10 +160,17 @@ func TestPresenceTracksWhoIsHere(t *testing.T) {
 	broker, pres := NewMemoryBroker(), newPresence()
 
 	first := &room{Topic: "lobby", Who: "ana"}
-	mountSession(t, "a", first, broker, pres)
+	sessA := mountSession(t, "a", first, broker, pres)
 
-	if got := first.Presence("lobby"); len(got) != 1 || got[0].Session != "a" {
+	// The roster names the page by its tag, never by its id: it goes to
+	// everyone on the topic, and a component rendering it would otherwise
+	// print every other page's capability into this page's markup.
+	got := first.Presence("lobby")
+	if len(got) != 1 || got[0].Tag != sessA.Tag() {
 		t.Fatalf("roster after one join = %v", got)
+	}
+	if got[0].Tag == sessA.ID() {
+		t.Error("the roster carries the session id")
 	}
 	waitFor(t, time.Second, func() bool {
 		_, joins := first.seen()
@@ -394,19 +401,44 @@ func TestUnmountStopsATimer(t *testing.T) {
 	child := n.cmp.(*ticker)
 	waitFor(t, time.Second, func() bool { return child.count() > 0 }, "the timer to tick")
 
-	// Stop rendering its key: the child is unmounted.
-	l.Labels = nil
-	if _, err := sess.Render(ctx); err != nil {
+	// Stop rendering its key: the child is unmounted. Both the field write
+	// and the render go through the session's goroutine, the way a handler
+	// does them - from here they race the timer this test is about.
+	if err := sess.call(func() error {
+		l.Labels = nil
+		_, err := sess.Render(ctx)
+		return err
+	}); err != nil {
 		t.Fatalf("re-render: %v", err)
 	}
 	if _, still := sess.node("c-1"); still {
 		t.Fatal("child was not unmounted")
 	}
 
+	// Settle before the baseline, so a tick queued before the unmount is
+	// counted in it rather than arriving afterwards and reading as one the
+	// timer kept firing.
+	settle(t, sess)
 	settled := child.count()
+
+	// The wait is the test. A timer that failed to stop needs wall-clock
+	// time to prove it, and 80ms is sixteen of its intervals - settling
+	// alone would pass the moment the ticker went quiet for a microsecond.
 	time.Sleep(80 * time.Millisecond)
+
+	settle(t, sess)
 	if got := child.count(); got != settled {
 		t.Errorf("timer kept firing after unmount: %d then %d", settled, got)
+	}
+}
+
+// settle waits for the session to finish everything already queued. The
+// mailbox is first-in-first-out, so an empty item coming back means every
+// item ahead of it has run.
+func settle(t *testing.T, sess *Session) {
+	t.Helper()
+	if err := sess.call(func() error { return nil }); err != nil {
+		t.Fatalf("settling: %v", err)
 	}
 }
 
@@ -424,15 +456,24 @@ func TestUnmountStopsASubscription(t *testing.T) {
 	n, _ := sess.node("c-1")
 	child := n.cmp.(*ticker)
 
-	l.Labels = nil
-	if _, err := sess.Render(ctx); err != nil {
+	if err := sess.call(func() error {
+		l.Labels = nil
+		_, err := sess.Render(ctx)
+		return err
+	}); err != nil {
 		t.Fatalf("re-render: %v", err)
 	}
 
 	if err := broker.Publish(ctx, "ticks", "after"); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
-	time.Sleep(80 * time.Millisecond)
+
+	// No sleep, and this one loses nothing by it: the in-memory broker
+	// delivers on the publisher's own goroutine, so by the time Publish has
+	// returned, any delivery is already sitting in the session's mailbox.
+	// Settling drains it - if this child were still subscribed, its message
+	// has already been queued and is about to be counted.
+	settle(t, sess)
 
 	if child.heard() != 0 {
 		t.Errorf("an unmounted child still received %d messages", child.heard())

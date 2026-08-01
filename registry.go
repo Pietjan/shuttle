@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -55,6 +57,30 @@ func newID() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+// tagFallback numbers tags when the entropy pool cannot be read, so that a
+// tag is always unique even then.
+var tagFallback atomic.Uint64
+
+// newTag returns the short label a session is known by wherever naming it
+// must not mean handing over the capability - logs, and the presence
+// roster. It is deliberately not derived from newID's output: an id that
+// never leaves this process in any form cannot leak in a derived one.
+//
+// Telling sessions apart is the whole requirement, so six bytes is plenty:
+// at the registry's cap of 10,000 live sessions the chance of any collision
+// is around one in five million.
+//
+// Uniqueness is load-bearing rather than cosmetic - presence keys its
+// members by this - so an unreadable entropy pool falls back to a counter
+// rather than to the empty string, which every session would then share.
+func newTag() string {
+	b := make([]byte, 6)
+	if _, err := rand.Read(b); err != nil {
+		return "n" + strconv.FormatUint(tagFallback.Add(1), 10)
+	}
+	return hex.EncodeToString(b)
+}
+
 // create registers a new session for cmp and starts its attach timer.
 func (r *registry) create(cmp Component, broker Broker, pres *presence, onError func(string, error)) (*Session, error) {
 	id, err := newID()
@@ -73,6 +99,29 @@ func (r *registry) create(cmp Component, broker Broker, pres *presence, onError 
 
 	r.expireIn(id, r.attach)
 	return s, nil
+}
+
+// ownedBy returns the ids of sessions labelled owner.
+//
+// The sessions are snapshotted under the registry's lock and asked for
+// their owner afterwards, rather than while holding it: two locks held at
+// once is a deadlock waiting for somebody to take them the other way round,
+// and there is no reason to here.
+func (r *registry) ownedBy(owner string) []string {
+	r.mu.Lock()
+	live := make([]*Session, 0, len(r.sessions))
+	for _, s := range r.sessions {
+		live = append(live, s)
+	}
+	r.mu.Unlock()
+
+	var ids []string
+	for _, s := range live {
+		if s.Owner() == owner {
+			ids = append(ids, s.ID())
+		}
+	}
+	return ids
 }
 
 // get returns the session for id.

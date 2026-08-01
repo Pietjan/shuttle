@@ -99,6 +99,11 @@ func TestUploadTravelsOnItsOwnRequest(t *testing.T) {
 
 // TestUploadRefusesTheWrongType: the picker was told the rules, and the
 // server enforces them anyway - a client's copy of a rule is a courtesy.
+//
+// The payload has to be real binary rather than a string that claims to be:
+// the server checks the content, so text pretending to be an executable is
+// text, and this component accepts text. The declared type is the lie in the
+// client's favour, which is the case worth covering.
 func TestUploadRefusesTheWrongType(t *testing.T) {
 	cmp := &files{}
 	p := open(t, func() shuttle.Component { return cmp })
@@ -106,8 +111,11 @@ func TestUploadRefusesTheWrongType(t *testing.T) {
 	picker := p.Locator(`input[type="file"]`)
 	if err := picker.SetInputFiles([]playwright.InputFile{{
 		Name:     "sneaky.bin",
-		MimeType: "application/octet-stream",
-		Buffer:   []byte("not text at all"),
+		MimeType: "text/plain",
+		Buffer: []byte{
+			'M', 'Z', 0x90, 0x00, 0x03, 0x00, 0x00, 0x00,
+			0x04, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00,
+		},
 	}}); err != nil {
 		t.Fatalf("choose a file: %v", err)
 	}

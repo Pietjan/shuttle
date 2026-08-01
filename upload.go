@@ -1,11 +1,13 @@
 package shuttle
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"mime"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -38,10 +40,22 @@ type Upload struct {
 	// Accept lists acceptable content types, as full types ("image/png") or
 	// wildcards ("image/*"). Empty accepts anything.
 	//
-	// It reaches the file picker as its accept attribute, but that is only
-	// a hint to the user: the check that counts happens on the server,
-	// because the client's is trivially skipped.
+	// It reaches the file picker as its accept attribute, but that is only a
+	// hint to the user. What is enforced is the type detected from the
+	// file's own first bytes - not the one the client declared, which is a
+	// string an attacker writes, and which would make this check a
+	// formality: an executable labelled image/png would pass it.
 	Accept []string
+
+	// TrustDeclaredType checks the client's declared content type instead of
+	// the one detected from the bytes.
+	//
+	// The detection is signature-based, so a container format arrives as its
+	// container: a .docx is a zip and a .csv is text/plain. The second is
+	// handled - any text/* entry accepts detected text - but the first is
+	// not, and cannot be without opening the archive. Set this for those
+	// formats, and know that it makes Accept a courtesy for that upload.
+	TrustDeclaredType bool
 }
 
 // DefaultMaxUploadSize is the per-file limit when an Upload leaves MaxSize
@@ -109,8 +123,14 @@ type UploadedFile struct {
 	Name string
 	// Size is the number of bytes received.
 	Size int64
-	// Type is the content type the client declared.
+	// Type is the content type detected from the file's own first bytes,
+	// which is what Accept was checked against. Trustworthy, and coarse:
+	// see [Upload.TrustDeclaredType].
 	Type string
+	// DeclaredType is what the client said it was sending. Client-controlled
+	// input like Name: useful for a filename hint or a log line, never a
+	// basis for a decision.
+	DeclaredType string
 
 	path string
 }
@@ -192,6 +212,21 @@ func uploadFor(cmp Component, name string) (Upload, bool) {
 // receive streams one part to a temp file, refusing anything over the
 // limit rather than reading it and complaining afterwards.
 func receive(part io.Reader, filename, contentType string, spec Upload) (*UploadedFile, error) {
+	// Sniff before anything is written. http.DetectContentType reads at most
+	// 512 bytes, so a file of the wrong kind is refused having cost that
+	// much rather than a temp file the size of whatever was sent.
+	head := make([]byte, 512)
+	n0, err := io.ReadFull(part, head)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return nil, err
+	}
+	head = head[:n0]
+
+	detected := http.DetectContentType(head)
+	if !spec.TrustDeclaredType && !spec.acceptsDetected(detected) {
+		return nil, fmt.Errorf("%w: %s is %s", ErrFileType, filename, detected)
+	}
+
 	tmp, err := os.CreateTemp("", "shuttle-upload-*")
 	if err != nil {
 		return nil, err
@@ -201,7 +236,8 @@ func receive(part io.Reader, filename, contentType string, spec Upload) (*Upload
 	max := spec.maxSize()
 	// One byte past the limit is enough to know it was exceeded, without
 	// reading the rest of whatever was sent.
-	n, err := io.Copy(tmp, io.LimitReader(part, max+1))
+	body := io.MultiReader(bytes.NewReader(head), part)
+	n, err := io.Copy(tmp, io.LimitReader(body, max+1))
 	if err != nil {
 		_ = os.Remove(tmp.Name())
 		return nil, err
@@ -212,11 +248,34 @@ func receive(part io.Reader, filename, contentType string, spec Upload) (*Upload
 	}
 
 	return &UploadedFile{
-		Name: filename,
-		Size: n,
-		Type: contentType,
-		path: tmp.Name(),
+		Name:         filename,
+		Size:         n,
+		Type:         detected,
+		DeclaredType: contentType,
+		path:         tmp.Name(),
 	}, nil
+}
+
+// acceptsDetected checks a sniffed type against Accept.
+//
+// It is accepts with one allowance: http.DetectContentType collapses every
+// kind of text to text/plain, so a component accepting text/csv would
+// otherwise refuse csv files - the exact case where the declared type was
+// carrying the check.
+func (u Upload) acceptsDetected(detected string) bool {
+	if u.accepts(detected) {
+		return true
+	}
+	got, _, err := mime.ParseMediaType(detected)
+	if err != nil || got != "text/plain" {
+		return false
+	}
+	for _, want := range u.Accept {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(want)), "text/") {
+			return true
+		}
+	}
+	return false
 }
 
 // discard removes received files. Called once the handler has had its
@@ -261,9 +320,11 @@ func FileInput[O ~func(T), T any](ctx context.Context, attr Attrs[O], name strin
 		return func(T) {}
 	}
 
+	// No session in the URL: the shim adds it as a header, the same way
+	// every other request carries it. See [SessionHeader].
 	sess := sc.node.sess
-	endpoint := fmt.Sprintf("%s/upload/%s/%s/%s",
-		sess.prefix+routePrefix, sess.id, sc.path().nodeID(), name)
+	endpoint := fmt.Sprintf("%s/upload/%s/%s",
+		sess.prefix+routePrefix, sc.path().nodeID(), name)
 
 	attrs := []pair{
 		{"type", "file"},

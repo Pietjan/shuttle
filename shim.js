@@ -3,9 +3,11 @@
 // function at the top level and leave no global behind: the generated call
 // at the bottom of that script is the only caller.
 //
-// nav is this session's navigation endpoint; up is the session-free health
-// check.
-function shuttleShim({ nav, up }) {
+// nav is the navigation endpoint; up is the session-free health check. sid
+// is this page's session and header is the name it travels under - the same
+// header Datastar's own requests carry, because the id is a capability and
+// a URL is the most copied string in a system.
+function shuttleShim({ nav, up, sid, header }) {
   const root = document.documentElement;
 
   // Spelled out rather than built, so an app can grep for the class it
@@ -27,6 +29,17 @@ function shuttleShim({ nav, up }) {
   };
   set('connecting');
 
+  // Every fetch datastar makes dispatches this same event on document, so
+  // the element that started one is the only way to tell the page's stream
+  // from an action's request. The stream is opened from data-init; a click
+  // is opened from the button.
+  //
+  // It matters for failures and not for successes. An action that fails -
+  // a refused origin, a bad payload, a spent request budget - says nothing
+  // about the connection, and reporting it as a lost one puts "connection
+  // lost" over a stream that is working. A success is proof either way.
+  const fromStream = (el) => el instanceof Element && el.matches('[data-init]');
+
   document.addEventListener('datastar-fetch', (e) => {
     const d = e.detail || {};
 
@@ -36,8 +49,8 @@ function shuttleShim({ nav, up }) {
       // does not sit on 'connecting' until the first heartbeat.
       set('connected');
     } else if (d.type === 'error' || d.type === 'retrying') {
-      set('reconnecting');
-    } else if (d.type === 'retries-failed') {
+      if (fromStream(d.el)) set('reconnecting');
+    } else if (d.type === 'retries-failed' && fromStream(d.el)) {
       set('dead');
       // Datastar will not try again. Wait for the server to come back and
       // start over, rather than leaving a page that looks fine and is not.
@@ -150,6 +163,8 @@ function shuttleShim({ nav, up }) {
 
     const xhr = new XMLHttpRequest();
     xhr.open('POST', endpoint, true);
+    // After open, which is the only point a header can be set.
+    xhr.setRequestHeader(header, sid);
     el.setAttribute('data-shuttle-uploading', '');
     el.removeAttribute('data-shuttle-upload-error');
 
@@ -172,7 +187,7 @@ function shuttleShim({ nav, up }) {
   window.addEventListener('popstate', () => {
     fetch(nav, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', [header]: sid },
       body: JSON.stringify({ url: location.pathname + location.search }),
       keepalive: true,
     });

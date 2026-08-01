@@ -119,9 +119,12 @@ func signalAttrs(ns string, signals map[string]any) (string, error) {
 // because child namespaces are always numeric - which is the reason paths
 // are numbered rather than named after their keys. An object-valued signal
 // of the component's own, c.filters.name, is untouched by it.
+//
+// Returned as one clause of the options object rather than the whole of it,
+// because the session header shares that object - see [scope.actionExpr].
 func filterFor(ns string) string {
 	q := regexp.QuoteMeta(ns)
-	return fmt.Sprintf(`{filterSignals: {include: /^%s\./, exclude: /^%s\.[0-9]+\./}}`, q, q)
+	return fmt.Sprintf(`filterSignals: {include: /^%s\./, exclude: /^%s\.[0-9]+\./}`, q, q)
 }
 
 type signalsKey struct{}

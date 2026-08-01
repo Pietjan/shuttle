@@ -181,6 +181,40 @@ func TestStreamReplaceAndRemoveAddressTheItem(t *testing.T) {
 	}
 }
 
+// TestStreamPrependAddsToTheOtherEnd. Append and Prepend are the same call
+// with a different patch mode, and the mode is the whole difference between
+// a log that reads oldest-first and one that reads newest-first.
+func TestStreamPrependAddsToTheOtherEnd(t *testing.T) {
+	f := &feed{}
+	sess := streamSession(t, f)
+	ctx := context.Background()
+
+	if err := f.add(ctx, "older"); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if err := f.Stream("log").Prepend(ctx, "0", f.entry("0", "newer")); err != nil {
+		t.Fatalf("prepend: %v", err)
+	}
+
+	got := sess.take()
+	if len(got) != 2 {
+		t.Fatalf("got %d patches, want 2", len(got))
+	}
+	for i, want := range []string{"append", "prepend"} {
+		if string(got[i].mode) != want {
+			t.Errorf("patch %d mode = %q, want %q", i, got[i].mode, want)
+		}
+		if got[i].target != "shuttle-c-log" {
+			t.Errorf("patch %d targets %q, want the container", i, got[i].target)
+		}
+	}
+	// Both ends address the container itself; the item carries its own id so
+	// it can be replaced or removed afterwards.
+	if !strings.Contains(got[1].html, `id="shuttle-c-log-0"`) {
+		t.Errorf("prepended item is not addressable: %q", got[1].html)
+	}
+}
+
 // TestStreamItemMustCarryItsID. An item without the id can never be
 // replaced or removed, and nothing downstream would report it - Datastar
 // drops a patch whose target is missing with only a console warning.
@@ -247,7 +281,7 @@ func TestStreamOverTheTransport(t *testing.T) {
 	page, sid := getPage(t, srv)
 	stream := openStream(t, srv, sid)
 
-	if code := post(t, srv, clickURLs(t, fragment(t, page))[0]); code != http.StatusNoContent {
+	if code := post(t, srv, sid, clickURLs(t, fragment(t, page))[0]); code != http.StatusNoContent {
 		t.Fatalf("post: status %d", code)
 	}
 
@@ -293,25 +327,50 @@ func TestUnmountedComponentStreamsNothing(t *testing.T) {
 	t.Cleanup(func() { sess.close(context.Background()) })
 	ctx := context.Background()
 
-	// Show it, let it stream, then switch away - twice, because coming back
-	// to a component mounts a second instance under the same key and it is
-	// the second unmount that used to leak.
-	for round := range 2 {
-		p.Shown = "ticker"
-		if _, err := sess.Render(ctx); err != nil {
-			t.Fatalf("round %d: render: %v", round, err)
+	// Switching and rendering go through the session's goroutine, the way a
+	// handler does both. From here they race the timer: a tick can pass
+	// Stream.send's mounted check just as this goroutine unmounts the
+	// component underneath it, and enqueue against a node that has left the
+	// page - the very straggler being tested for, arriving by a route no
+	// page can take.
+	show := func(round int, what string) {
+		t.Helper()
+		if err := sess.call(func() error {
+			p.Shown = what
+			_, err := sess.Render(ctx)
+			return err
+		}); err != nil {
+			t.Fatalf("round %d: rendering %q: %v", round, what, err)
 		}
+	}
+
+	// Show it, let it stream, then switch away - twice, because coming back
+	// to a component mounts a second instance under the same key, and the
+	// second unmount is where a leak would show.
+	for round := range 2 {
+		show(round, "ticker")
 		waitFor(t, time.Second, func() bool {
 			return len(sess.take()) > 0
 		}, "the stream to produce something")
 
-		p.Shown = "quiet"
-		if _, err := sess.Render(ctx); err != nil {
-			t.Fatalf("round %d: switch away: %v", round, err)
-		}
+		show(round, "quiet")
+		// Drain what the component produced while it was mounted, including
+		// anything queued ahead of the unmount: the mailbox is
+		// first-in-first-out, so settling first means those have all landed
+		// and this take clears them.
+		settle(t, sess)
 		sess.take()
 
+		// Then wait, and that wait is the test rather than a hedge. Both
+		// things being checked - the timer stopping at unmount, and
+		// Stream.send refusing an unmounted node - are mechanisms that fail
+		// by *doing* something, and a tick needs wall-clock time to do it.
+		// Settling alone passes in microseconds, which is to say it passes
+		// whether or not either guard is there. Eight intervals is enough
+		// for a live ticker to give itself away.
 		time.Sleep(80 * time.Millisecond)
+
+		settle(t, sess)
 		if got := sess.take(); len(got) > 0 {
 			t.Errorf("round %d: %d patches after unmount, first targeting %q",
 				round, len(got), got[0].target)

@@ -34,6 +34,27 @@ const DefaultHeartbeat = 25 * time.Second
 // reconnect resumes it instead of starting over.
 const DefaultGrace = 30 * time.Second
 
+// DefaultMaxSignalBytes caps an action's JSON body when Handler leaves
+// MaxSignalBytes unset.
+const DefaultMaxSignalBytes = 64 << 10 // 64 KiB
+
+// Request budget defaults, per session.
+//
+// Sized against what a page actually does rather than against a round
+// number. A change binding fires per keystroke through a client-side
+// debounce, so a fast typist produces about three requests a second; a
+// table's sort, filter and page can arrive in a burst. The burst is a
+// little under the session mailbox's depth, because a burst larger than
+// that is one already blocking request goroutines.
+const (
+	// DefaultRequestRate is the sustained requests per second a session
+	// earns back.
+	DefaultRequestRate = 10.0
+
+	// DefaultRequestBurst is the most it can spend at once.
+	DefaultRequestBurst = 40.0
+)
+
 // Handler serves one component as a live page: the first GET returns a
 // complete server-rendered document, the page then opens a persistent
 // stream and attaches to the markup already in the DOM.
@@ -118,6 +139,40 @@ type Handler struct {
 	// stray GET.
 	Subtree bool
 
+	// CheckOrigin decides whether a request that changes something may
+	// proceed. Nil compares the Origin header's host against the request's
+	// own and allows a request that sends none, which is the same rule
+	// gorilla/websocket applies.
+	//
+	// Set it to allow another origin - a page embedding this handler from
+	// elsewhere - or to refuse the empty case, which no browser produces but
+	// every other client does.
+	CheckOrigin func(r *http.Request) bool
+
+	// RequestRate is how many requests per second a session earns back, and
+	// RequestBurst the most it may spend at once. Zero means the defaults;
+	// a negative RequestRate turns the limit off.
+	//
+	// The budget is per session and refills continuously, so a page open all
+	// day is in the same position as one just opened: there is no window to
+	// reset and none to wait out. It rations every transport request a page
+	// makes, because each one queues work onto that page's single goroutine
+	// - and, if the component publishes, onto every subscriber's.
+	//
+	// It is not a defence against an anonymous flood: a session id is free
+	// to anybody who loads the page, so an attacker takes a fresh one rather
+	// than emptying a bucket. What it bounds is what one page can do.
+	RequestRate  float64
+	RequestBurst float64
+
+	// MaxSignalBytes caps the JSON body an action may carry. Zero means
+	// DefaultMaxSignalBytes.
+	//
+	// Signals are a component's client-side state, so the ceiling only has
+	// to cover what the component asked for - a form's worth of fields, not
+	// a file. Uploads have their own route and their own limit.
+	MaxSignalBytes int64
+
 	// Grace is how long a session outlives its stream, so a reconnect
 	// resumes it rather than starting over. Zero means DefaultGrace.
 	Grace time.Duration
@@ -191,10 +246,15 @@ func (h *Handler) mux() *http.ServeMux {
 		base := strings.TrimSuffix(h.Prefix, "/")
 
 		m := http.NewServeMux()
-		m.HandleFunc("GET "+base+routePrefix+"/live/{sid}", h.serveStream)
-		m.HandleFunc("POST "+base+routePrefix+"/act/{sid}/{node}/{aid}", h.serveAction)
-		m.HandleFunc("POST "+base+routePrefix+"/nav/{sid}", h.serveNav)
-		m.HandleFunc("POST "+base+routePrefix+"/upload/{sid}/{node}/{name}", h.serveUpload)
+		m.HandleFunc("GET "+base+routePrefix+"/live", private(h.serveStream))
+		// The three routes that change something are the three that get the
+		// origin check.
+		m.HandleFunc("POST "+base+routePrefix+"/act/{node}/{aid}",
+			private(h.sameOrigin(h.budgeted(h.serveAction))))
+		m.HandleFunc("POST "+base+routePrefix+"/nav",
+			private(h.sameOrigin(h.budgeted(h.serveNav))))
+		m.HandleFunc("POST "+base+routePrefix+"/upload/{node}/{name}",
+			private(h.sameOrigin(h.budgeted(h.serveUpload))))
 		// Session-free on purpose: a page whose own session has died polls
 		// this until the server answers, and must not mint a session per
 		// attempt.
@@ -227,6 +287,204 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux().ServeHTTP(w, r)
 }
 
+// Close ends the session with this id: its components unmount, its
+// subscriptions, timers and presence stop, and its stream ends. It reports
+// whether there was one.
+//
+// The page recovers by itself and that is the point. Datastar reconnects,
+// finds a session this server no longer has, and gets the same answer a
+// restart gives it - reload - which sends the browser back through
+// whatever middleware fronts this handler. So logging out is Close plus the
+// authentication you already have, rather than a second way to say no.
+//
+// Safe to call from anywhere, including from inside an action: closing does
+// not wait on the session's goroutine.
+func (h *Handler) Close(sid string) bool {
+	if _, ok := h.sessions.get(sid); !ok {
+		return false
+	}
+	h.sessions.remove(sid)
+	return true
+}
+
+// CloseOwner ends every session labelled owner by [Session.SetOwner], and
+// returns how many. It is what logging out calls: one person can have the
+// same page open in four tabs, and each is its own session.
+func (h *Handler) CloseOwner(owner string) int {
+	if owner == "" {
+		// Every unlabelled session matches "", which would log out the
+		// pages of everyone who never called SetOwner.
+		return 0
+	}
+	var n int
+	for _, sid := range h.sessions.ownedBy(owner) {
+		if h.Close(sid) {
+			n++
+		}
+	}
+	return n
+}
+
+// private marks a transport response as belonging to one session and no
+// other.
+//
+// Every one of these routes answers for the session named in
+// [SessionHeader], so two requests to the same URL are two different
+// answers. A cache keying on the URL alone would be entitled to hand one
+// page's response to another - Vary is what says it may not, and no-store
+// says not to keep it at all.
+func private(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Vary", SessionHeader)
+		next(w, r)
+	}
+}
+
+// budgeted refuses a request the session has no tokens left for.
+//
+// It runs before the handler rather than inside it so that a refusal costs
+// a map lookup and a mutex - nothing is decoded, no work is queued, and the
+// session's goroutine never hears about it. A request naming no live
+// session passes through to be refused as the 404 it is.
+func (h *Handler) budgeted(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		sess, ok := h.sessionOf(r)
+		if ok && !sess.allow(h.requestRate(), h.requestBurst(), time.Now()) {
+			h.log().Warn("shuttle: request budget exhausted",
+				"session", sess.Tag(), "path", r.URL.Path)
+			// A second is the whole burst back at the default rate, and the
+			// client is a browser that will not read it anyway - it is for
+			// whatever is between us.
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "too many requests", http.StatusTooManyRequests)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// sameOrigin rejects a cross-origin request before it reaches a handler
+// that changes something.
+//
+// It is defence in depth rather than the thing standing between a stranger
+// and this page: the session id is an unguessable capability read out of
+// the page by script, not a cookie the browser attaches by itself, so a
+// forged cross-site POST has nothing to replay. What this guards is the
+// app that adds its own cookie authentication alongside shuttle and
+// reintroduces exactly the ambient authority the design does without.
+func (h *Handler) sameOrigin(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !h.originOK(r) {
+			h.log().Warn("shuttle: cross-origin request refused",
+				"origin", r.Header.Get("Origin"), "path", r.URL.Path)
+			http.Error(w, "cross-origin request", http.StatusForbidden)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// originOK is the check itself, and follows gorilla/websocket's
+// checkSameOrigin: compare hosts, and allow a request that sends no Origin
+// at all.
+//
+// Allowing the empty case is deliberate. Browsers send Origin on every
+// fetch that is not a plain GET, so a POST without one did not come from a
+// page - it came from curl, a test, or a service - and cannot be a forgery
+// on somebody's behalf. Refusing it would break every non-browser caller to
+// prevent nothing.
+//
+// Only the host is compared, not the scheme: an app served over both ends
+// up refusing itself otherwise. Set CheckOrigin to be stricter, or to allow
+// the one other origin an embedded page is served from.
+func (h *Handler) originOK(r *http.Request) bool {
+	if h.CheckOrigin != nil {
+		return h.CheckOrigin(r)
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host)
+}
+
+// refusals are the errors whose text may be written into a response. Every
+// one is a constant of this package's own describing a rule the client
+// broke, so it tells the client something it needs and discloses nothing.
+//
+// Everything else gets a generic message. An error from application code -
+// or worse, [ErrPanic], which carries the panic value - can name a table, a
+// path on disk or whatever was in scope when it failed, and an HTTP body is
+// the one place that must never end up. The log still gets all of it.
+var refusals = []error{
+	ErrNoSession, ErrNoAction, ErrNoUpload, ErrNoFiles,
+	ErrTooManyFiles, ErrFileTooLarge, ErrFileType, ErrAlreadyAttached,
+	ErrTooManySessions, errBadSignals,
+}
+
+// fail logs err and answers with a message that is safe to show.
+func (h *Handler) fail(w http.ResponseWriter, r *http.Request, status int, what string, err error, extra ...any) {
+	h.log().Error("shuttle: "+what,
+		append([]any{"path", r.URL.Path, "err", err}, extra...)...)
+	http.Error(w, publicMessage(status, err), status)
+}
+
+// publicMessage is what the client is told: the refusal itself when the
+// error is one, and otherwise nothing but the status.
+func publicMessage(status int, err error) string {
+	for _, refusal := range refusals {
+		if errors.Is(err, refusal) {
+			return refusal.Error()
+		}
+	}
+	if status == http.StatusBadRequest {
+		return "bad request"
+	}
+	return http.StatusText(status)
+}
+
+// SessionHeader carries the session id on every transport request.
+//
+// It is a header rather than a path segment because a URL is the most
+// copied string in a system: access logs, proxy logs, APM spans and error
+// trackers all record one, and the session id is the capability for the
+// whole page. Redacting shuttle's own logs only ever fixed the half of that
+// this process controls.
+//
+// It buys a second thing. A cross-origin request cannot set a custom header
+// without a CORS preflight, and nothing here answers one - so this header
+// can only be attached by a page served from the same origin, whatever an
+// attacker knows.
+const SessionHeader = "Shuttle-Session"
+
+// sessionHeaderExpr is the headers option every request datastar makes on
+// this session's behalf carries. Datastar merges it over its own defaults,
+// for a GET stream as readily as for a POST.
+//
+// The id is a hex string from crypto/rand, so it needs no escaping to sit
+// inside a single-quoted Datastar expression - but it is written through
+// %q on the way in, so the day that stops being true this breaks loudly
+// rather than quietly emitting a broken attribute.
+func sessionHeaderExpr(s *Session) string {
+	return fmt.Sprintf(`{%q: %q}`, SessionHeader, s.ID())
+}
+
+// sessionOf returns the session a transport request names, or false. The id
+// arrives in [SessionHeader]; a request without one names nothing, which is
+// the same answer as naming a session that has gone.
+func (h *Handler) sessionOf(r *http.Request) (*Session, bool) {
+	id := r.Header.Get(SessionHeader)
+	if id == "" {
+		return nil, false
+	}
+	return h.sessions.get(id)
+}
+
 // checkIDs reports duplicate element ids in a render. A duplicate is
 // excluded from Datastar's persistent-id set, which drops that subtree to
 // soft matching with no error anywhere - so in Debug it is worth saying so.
@@ -236,7 +494,7 @@ func (h *Handler) checkIDs(sess *Session, markup string) {
 	}
 	if dupes := DuplicateIDs(markup); dupes != nil {
 		h.log().Warn("shuttle: duplicate element ids will degrade morphing",
-			"session", sess.ID(), "ids", dupes)
+			"session", sess.Tag(), "ids", dupes)
 	}
 }
 
@@ -259,8 +517,7 @@ func (h *Handler) broker() Broker {
 func (h *Handler) servePage(w http.ResponseWriter, r *http.Request) {
 	sess, err := h.sessions.create(h.factory(), h.broker(), h.presence, h.sessionError)
 	if err != nil {
-		h.log().Error("shuttle: cannot start a session", "err", err)
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		h.fail(w, r, http.StatusServiceUnavailable, "cannot start a session", err)
 		return
 	}
 
@@ -369,8 +626,8 @@ func DefaultShell(w io.Writer, p Page) error {
 // belongs on <body>, outside the component's morph target, or every patch
 // would re-initialise it and open a second stream.
 func attachExpr(s *Session, openWhenHidden bool) string {
-	return fmt.Sprintf(`@get('%s/live/%s', {openWhenHidden: %t, retry: 'always'})`,
-		s.prefix+routePrefix, s.ID(), openWhenHidden)
+	return fmt.Sprintf(`@get('%s/live', {openWhenHidden: %t, retry: 'always', headers: %s})`,
+		s.prefix+routePrefix, openWhenHidden, sessionHeaderExpr(s))
 }
 
 // serveStream is the second phase: one persistent SSE stream per page,
@@ -378,7 +635,7 @@ func attachExpr(s *Session, openWhenHidden bool) string {
 // action responses, server pushes, later pub/sub - comes down this one
 // connection, which is also the only ordering guarantee available.
 func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request) {
-	sess, ok := h.sessions.get(r.PathValue("sid"))
+	sess, ok := h.sessionOf(r)
 	if !ok {
 		// The page is holding a session this server has never heard of -
 		// it was evicted, or the server restarted under it. A 404 would be
@@ -392,7 +649,7 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := sess.attach(); err != nil {
-		http.Error(w, err.Error(), http.StatusConflict)
+		http.Error(w, publicMessage(http.StatusConflict, err), http.StatusConflict)
 		return
 	}
 	h.sessions.hold(sess.ID())
@@ -406,7 +663,7 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request) {
 
 	sse := datastar.NewSSE(w, r)
 	if err := sess.stream(sse, h.heartbeat()); err != nil {
-		h.log().Debug("shuttle: stream ended", "session", sess.ID(), "err", err)
+		h.log().Debug("shuttle: stream ended", "session", sess.Tag(), "err", err)
 	}
 }
 
@@ -431,6 +688,27 @@ func (h *Handler) openWhenHidden() bool {
 	return h.OpenWhenHidden == nil || *h.OpenWhenHidden
 }
 
+func (h *Handler) requestRate() float64 {
+	if h.RequestRate == 0 {
+		return DefaultRequestRate
+	}
+	return h.RequestRate
+}
+
+func (h *Handler) requestBurst() float64 {
+	if h.RequestBurst <= 0 {
+		return DefaultRequestBurst
+	}
+	return h.RequestBurst
+}
+
+func (h *Handler) maxSignalBytes() int64 {
+	if h.MaxSignalBytes <= 0 {
+		return DefaultMaxSignalBytes
+	}
+	return h.MaxSignalBytes
+}
+
 func (h *Handler) grace() time.Duration {
 	if h.Grace > 0 {
 		return h.Grace
@@ -451,11 +729,16 @@ func (h *Handler) heartbeat() time.Duration {
 // stream, because one writer is what gives patches a total order. Separate
 // one-shot responses would have none.
 func (h *Handler) serveAction(w http.ResponseWriter, r *http.Request) {
-	sess, ok := h.sessions.get(r.PathValue("sid"))
+	sess, ok := h.sessionOf(r)
 	if !ok {
 		http.Error(w, ErrNoSession.Error(), http.StatusNotFound)
 		return
 	}
+
+	// Signals are client-controlled and decoded into memory whole, so the
+	// body needs a ceiling the way navigation and uploads already have one.
+	// Without it a single POST is a way to exhaust the process.
+	r.Body = http.MaxBytesReader(w, r.Body, h.maxSignalBytes())
 
 	n, ok := sess.node(r.PathValue("node"))
 	if !ok {
@@ -484,10 +767,9 @@ func (h *Handler) serveAction(w http.ResponseWriter, r *http.Request) {
 			// decode is a bad request, not a server fault.
 			status = http.StatusBadRequest
 		}
-		h.log().Error("shuttle: action failed",
-			"session", sess.ID(), "node", r.PathValue("node"),
-			"action", r.PathValue("aid"), "err", err)
-		http.Error(w, err.Error(), status)
+		h.fail(w, r, status, "action failed", err,
+			"session", sess.Tag(), "node", r.PathValue("node"),
+			"action", r.PathValue("aid"))
 		return
 	}
 
@@ -498,7 +780,7 @@ func (h *Handler) serveAction(w http.ResponseWriter, r *http.Request) {
 // navigation the server cannot see for itself. The page reports where
 // history moved to, and the re-render comes back down the stream.
 func (h *Handler) serveNav(w http.ResponseWriter, r *http.Request) {
-	sess, ok := h.sessions.get(r.PathValue("sid"))
+	sess, ok := h.sessionOf(r)
 	if !ok {
 		http.Error(w, ErrNoSession.Error(), http.StatusNotFound)
 		return
@@ -527,8 +809,8 @@ func (h *Handler) serveNav(w http.ResponseWriter, r *http.Request) {
 	if err := sess.call(func() error {
 		return sess.applyLocation(r.Context(), u)
 	}); err != nil {
-		h.log().Error("shuttle: navigation failed", "session", sess.ID(), "err", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		h.fail(w, r, http.StatusInternalServerError, "navigation failed", err,
+			"session", sess.Tag())
 		return
 	}
 
@@ -542,7 +824,7 @@ func (h *Handler) serveNav(w http.ResponseWriter, r *http.Request) {
 // the same rules: accept attributes and size limits in the page are a
 // courtesy to the user, and nothing more.
 func (h *Handler) serveUpload(w http.ResponseWriter, r *http.Request) {
-	sess, ok := h.sessions.get(r.PathValue("sid"))
+	sess, ok := h.sessionOf(r)
 	if !ok {
 		http.Error(w, ErrNoSession.Error(), http.StatusNotFound)
 		return
@@ -561,7 +843,7 @@ func (h *Handler) serveUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, ok := n.cmp.(UploadHandler); !ok {
 		h.log().Error("shuttle: upload has nowhere to go",
-			"session", sess.ID(), "upload", name, "err", ErrNoUploadHandler)
+			"session", sess.Tag(), "upload", name, "err", ErrNoUploadHandler)
 		http.Error(w, ErrNoUploadHandler.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -574,8 +856,8 @@ func (h *Handler) serveUpload(w http.ResponseWriter, r *http.Request) {
 			status = http.StatusRequestEntityTooLarge
 		}
 		h.log().Info("shuttle: upload refused",
-			"session", sess.ID(), "upload", name, "err", err)
-		http.Error(w, err.Error(), status)
+			"session", sess.Tag(), "upload", name, "err", err)
+		http.Error(w, publicMessage(status, err), status)
 		return
 	}
 	// The handler gets one look at the files; anything worth keeping is its
@@ -589,9 +871,8 @@ func (h *Handler) serveUpload(w http.ResponseWriter, r *http.Request) {
 		return n.push(r.Context())
 	})
 	if err != nil {
-		h.log().Error("shuttle: handling an upload",
-			"session", sess.ID(), "upload", name, "err", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		h.fail(w, r, http.StatusInternalServerError, "handling an upload", err,
+			"session", sess.Tag(), "upload", name)
 		return
 	}
 
@@ -629,11 +910,11 @@ func (h *Handler) receiveAll(w http.ResponseWriter, r *http.Request, spec Upload
 			return files, fmt.Errorf("%w: at most %d", ErrTooManyFiles, spec.maxFiles())
 		}
 
+		// The declared type is recorded, never acted on: receive checks the
+		// bytes. Refusing on the label here would reject a genuine file a
+		// browser happened to send as application/octet-stream, and would
+		// still pass anything an attacker chose to call an image.
 		contentType := part.Header.Get("Content-Type")
-		if !spec.accepts(contentType) {
-			_ = part.Close()
-			return files, fmt.Errorf("%w: %q", ErrFileType, contentType)
-		}
 
 		f, err := receive(part, part.FileName(), contentType, spec)
 		_ = part.Close()

@@ -257,7 +257,7 @@ func TestFormRoundTrip(t *testing.T) {
 	var submit string
 
 	// Typing something that fails validation reports, but commits nothing.
-	if code := postBody(t, srv, change, `{"c":{"email":"nope"}}`); code != http.StatusNoContent {
+	if code := postBody(t, srv, sid, change, `{"c":{"email":"nope"}}`); code != http.StatusNoContent {
 		t.Fatalf("change: status %d", code)
 	}
 	if c.Errors.OK() {
@@ -274,7 +274,7 @@ func TestFormRoundTrip(t *testing.T) {
 	_, submit = c.urls(t, markup)
 
 	// Submitting it still refuses.
-	if code := postBody(t, srv, submit, `{"c":{"email":"nope"}}`); code != http.StatusNoContent {
+	if code := postBody(t, srv, sid, submit, `{"c":{"email":"nope"}}`); code != http.StatusNoContent {
 		t.Fatalf("bad submit: status %d", code)
 	}
 	if c.Saved {
@@ -285,7 +285,7 @@ func TestFormRoundTrip(t *testing.T) {
 	_, submit = c.urls(t, markup)
 
 	// Fixing it and submitting commits.
-	if code := postBody(t, srv, submit, `{"c":{"email":"real@example.com"}}`); code != http.StatusNoContent {
+	if code := postBody(t, srv, sid, submit, `{"c":{"email":"real@example.com"}}`); code != http.StatusNoContent {
 		t.Fatalf("good submit: status %d", code)
 	}
 	if !c.Saved || c.Email != "real@example.com" {

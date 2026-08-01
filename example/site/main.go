@@ -175,10 +175,10 @@ func main() {
 	prerender(all)
 
 	// One handler for every example, so the whole site is one session and
-	// one stream. Nine handlers with href links between them would be nine
-	// page loads and nine streams, and a browser only allows about six
-	// connections per origin - which is exactly how this site used to stop
-	// loading once enough examples had been opened.
+	// one stream. A handler apiece with href links between them would be a
+	// page load and a stream apiece, and a browser allows about six
+	// connections per origin - so the site stops loading once enough
+	// examples are open.
 	h := shuttle.New(func() shuttle.Component { return &Site{All: all} })
 	h.Prefix = "/e"
 	h.Subtree = true
@@ -341,18 +341,15 @@ func sourceBlock(file string) templ.Component {
 // the headings, the callouts and the source blocks are Loom's, which is the
 // split Loom asks for: it styles components, not your document.
 //
-// What is left here has to be hand-written rather than Tailwind utilities.
-// cmd/css points Tailwind's @source at Loom's module directory, so every
-// class inside a Loom component is compiled - but nothing scans this site's
-// own sources, so a utility written here would not be in the sheet at all.
-// siteCSS is what could not become a class, and it is now one rule.
+// What is left here is what could not become a Tailwind class, and it is
+// now one rule. The entry file imports loom.css, whose @source is loom's
+// module directory, and @sources this repository as well - so a class
+// written in the site or in live/ is compiled too, and everything this
+// constant used to declare is a class on the element that needed it.
 //
 // The upload bar's fill is loom's progress-bar element, which carries an
 // inline width - so this has to out-specify an inline style from outside the
-// component, and !important is the honest way to say that. Everything else
-// the site used to declare here is a Tailwind class on the element that
-// needed it, because the entry file @sources this repository as well as
-// loom.
+// component, and !important is the honest way to say that.
 const siteCSS = `
 input[data-shuttle-uploading] ~ [data-ui="progress"] [data-ui="progress-bar"] {
     width: var(--shuttle-progress, 0%) !important;

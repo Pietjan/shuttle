@@ -91,7 +91,10 @@ func (p *panicker) Render(ctx context.Context) templ.Component {
 // --- helpers ---------------------------------------------------------------
 
 var (
-	sessionRE = regexp.MustCompile(`/_shuttle/live/([0-9a-f]+)`)
+	// The shim's generated call carries the id plainly; a Shell that drops
+	// Page.Scripts leaves only the attach attribute, whose quotes may or may
+	// not be HTML-escaped depending on how the Shell writes them.
+	sessionRE = regexp.MustCompile(`sid: "([0-9a-f]+)"|Shuttle-Session(?:&#34;|"): (?:&#34;|")([0-9a-f]+)`)
 	// The expression carries fetch options after the URL, so this stops at
 	// the closing quote of the path rather than the closing paren.
 	clickRE = regexp.MustCompile(`data-on:click="@post\(&#39;([^&]+)&#39;`)
@@ -146,7 +149,7 @@ func getPage(t *testing.T, srv *httptest.Server) (page, sid string) {
 	if m == nil {
 		t.Fatalf("page carries no session id: %q", body)
 	}
-	return string(body), m[1]
+	return string(body), m[1] + m[2]
 }
 
 // sseReader reads one SSE event block at a time without letting a stalled
@@ -160,10 +163,11 @@ type sseReader struct {
 func openStream(t *testing.T, srv *httptest.Server, sid string) *sseReader {
 	t.Helper()
 
-	req, err := http.NewRequest(http.MethodGet, srv.URL+routePrefix+"/live/"+sid, nil)
+	req, err := http.NewRequest(http.MethodGet, srv.URL+routePrefix+"/live", nil)
 	if err != nil {
 		t.Fatalf("stream request: %v", err)
 	}
+	req.Header.Set(SessionHeader, sid)
 	resp, err := srv.Client().Do(req)
 	if err != nil {
 		t.Fatalf("open stream: %v", err)
@@ -242,6 +246,18 @@ func (r *sseReader) event(t *testing.T) string {
 	}
 }
 
+// ended reports whether the stream has finished - the server let the
+// request return, and the client's read hit EOF. Non-blocking, so it can be
+// polled while waiting for a teardown.
+func (r *sseReader) ended() bool {
+	select {
+	case <-r.errs:
+		return true
+	default:
+		return false
+	}
+}
+
 // silent reports whether the stream stays quiet, which is what attaching to
 // an already-rendered page should do.
 func (r *sseReader) silent(d time.Duration) bool {
@@ -261,12 +277,13 @@ func (r *sseReader) silent(d time.Duration) bool {
 	}
 }
 
-func post(t *testing.T, srv *httptest.Server, path string) int {
+func post(t *testing.T, srv *httptest.Server, sid, path string) int {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, srv.URL+path, nil)
 	if err != nil {
 		t.Fatalf("action request: %v", err)
 	}
+	req.Header.Set(SessionHeader, sid)
 	resp, err := srv.Client().Do(req)
 	if err != nil {
 		t.Fatalf("post action: %v", err)
@@ -322,8 +339,10 @@ func TestAttachOptionsAreNotOptional(t *testing.T) {
 
 	// data-init, because Datastar v1 has no load event; on <body>, because
 	// anything inside the morph target would re-initialise on every patch.
+	// The session travels in a header rather than the URL, so it is the
+	// headers option that carries it - HTML-escaped, like any attribute.
 	want := fmt.Sprintf(
-		`<body data-init="@get(&#39;/_shuttle/live/%s&#39;, {openWhenHidden: true, retry: &#39;always&#39;})">`,
+		`<body data-init="@get(&#39;/_shuttle/live&#39;, {openWhenHidden: true, retry: &#39;always&#39;, headers: {&#34;Shuttle-Session&#34;: &#34;%s&#34;}})">`,
 		sid,
 	)
 	if !strings.Contains(page, want) {
@@ -487,7 +506,7 @@ func TestCounterRoundTrip(t *testing.T) {
 		// Post to the increment endpoint the current markup names, exactly
 		// as a browser would - which also proves the action ids in each
 		// morph are the ones the next click can use.
-		if code := post(t, srv, clickURLs(t, markup)[0]); code != http.StatusNoContent {
+		if code := post(t, srv, sid, clickURLs(t, markup)[0]); code != http.StatusNoContent {
 			t.Fatalf("click %d: status %d, want 204", want, code)
 		}
 
@@ -506,7 +525,7 @@ func TestCounterRoundTrip(t *testing.T) {
 
 	// The second binding is reset, so state really is held server-side
 	// across independent requests rather than echoed back by the client.
-	if code := post(t, srv, clickURLs(t, markup)[1]); code != http.StatusNoContent {
+	if code := post(t, srv, sid, clickURLs(t, markup)[1]); code != http.StatusNoContent {
 		t.Fatalf("reset: status %d", code)
 	}
 	if evt := stream.event(t); !strings.Contains(evt, `<output id="count">0</output>`) {
@@ -629,13 +648,18 @@ func TestUnknownSessionAndAction(t *testing.T) {
 
 	_, sid := getPage(t, srv)
 
-	if code := post(t, srv, routePrefix+"/act/deadbeef/c/1-a1"); code != http.StatusNotFound {
+	if code := post(t, srv, "deadbeef", routePrefix+"/act/c/1-a1"); code != http.StatusNotFound {
 		t.Errorf("unknown session: status %d, want 404", code)
 	}
-	if code := post(t, srv, routePrefix+"/act/"+sid+"/c/9-a9"); code != http.StatusNotFound {
+	// And no session named at all, which is what a request that never came
+	// from one of our pages looks like.
+	if code := post(t, srv, "", routePrefix+"/act/c/1-a1"); code != http.StatusNotFound {
+		t.Errorf("no session header: status %d, want 404", code)
+	}
+	if code := post(t, srv, sid, routePrefix+"/act/c/9-a9"); code != http.StatusNotFound {
 		t.Errorf("unknown action: status %d, want 404", code)
 	}
-	if code := post(t, srv, routePrefix+"/act/"+sid+"/c-7/1-a1"); code != http.StatusNotFound {
+	if code := post(t, srv, sid, routePrefix+"/act/c-7/1-a1"); code != http.StatusNotFound {
 		t.Errorf("unknown component: status %d, want 404", code)
 	}
 
@@ -644,7 +668,12 @@ func TestUnknownSessionAndAction(t *testing.T) {
 	// no amount of retrying brings back state that lived in memory the
 	// server no longer has - after a restart, starting over is the only way
 	// back.
-	resp, err := srv.Client().Get(srv.URL + routePrefix + "/live/deadbeef")
+	req, err := http.NewRequest(http.MethodGet, srv.URL+routePrefix+"/live", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(SessionHeader, "deadbeef")
+	resp, err := srv.Client().Do(req)
 	if err != nil {
 		t.Fatalf("stream for unknown session: %v", err)
 	}
@@ -673,7 +702,12 @@ func TestSecondStreamIsRejected(t *testing.T) {
 	_, sid := getPage(t, srv)
 	openStream(t, srv, sid)
 
-	resp, err := srv.Client().Get(srv.URL + routePrefix + "/live/" + sid)
+	second, err := http.NewRequest(http.MethodGet, srv.URL+routePrefix+"/live", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second.Header.Set(SessionHeader, sid)
+	resp, err := srv.Client().Do(second)
 	if err != nil {
 		t.Fatalf("second stream: %v", err)
 	}
@@ -700,7 +734,7 @@ func TestActionPanicKeepsTheSessionAlive(t *testing.T) {
 	stream := openStream(t, srv, sid)
 	url := clickURLs(t, fragment(t, page))[0]
 
-	if code := post(t, srv, url); code != http.StatusInternalServerError {
+	if code := post(t, srv, sid, url); code != http.StatusInternalServerError {
 		t.Fatalf("panicking action: status %d, want 500", code)
 	}
 	if _, ok := h.sessions.get(sid); !ok {
@@ -709,7 +743,7 @@ func TestActionPanicKeepsTheSessionAlive(t *testing.T) {
 
 	// The same id still resolves, because the failed action never triggered
 	// a re-render, and this time the handler succeeds.
-	if code := post(t, srv, url); code != http.StatusNoContent {
+	if code := post(t, srv, sid, url); code != http.StatusNoContent {
 		t.Errorf("action after panic: status %d, want 204", code)
 	}
 	if evt := stream.event(t); !strings.Contains(evt, "event: datastar-patch-elements") {
@@ -744,6 +778,226 @@ func TestSessionOutlivesItsStream(t *testing.T) {
 		t.Fatal("session evicted the moment its stream dropped")
 	}
 	openStream(t, srv, sid)
+}
+
+// TestCrossOriginPostIsRefused. Defence in depth rather than the thing
+// keeping strangers out - that is the unguessable session id, which no
+// browser attaches by itself. This guards the app that adds cookie
+// authentication of its own and hands every route ambient authority again.
+func TestCrossOriginPostIsRefused(t *testing.T) {
+	h := New(func() Component { return &counter{} })
+	h.Logger = quietLogger()
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	page, sid := getPage(t, srv)
+	action := clickURLs(t, fragment(t, page))[0]
+
+	for name, tc := range map[string]struct {
+		origin string
+		path   string
+		want   int
+	}{
+		// No Origin at all: not a browser fetch, so not a forgery - curl and
+		// this test's own client land here.
+		"absent":      {"", action, http.StatusNoContent},
+		"same origin": {srv.URL, action, http.StatusNoContent},
+		"elsewhere":   {"https://evil.example", action, http.StatusForbidden},
+		"unparseable": {"://nonsense", action, http.StatusForbidden},
+		// Every route that changes something, not only actions.
+		"nav":    {"https://evil.example", routePrefix + "/nav", http.StatusForbidden},
+		"upload": {"https://evil.example", routePrefix + "/upload/c/f", http.StatusForbidden},
+	} {
+		t.Run(name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodPost, srv.URL+tc.path, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set(SessionHeader, sid)
+			if tc.origin != "" {
+				req.Header.Set("Origin", tc.origin)
+			}
+			resp, err := srv.Client().Do(req)
+			if err != nil {
+				t.Fatalf("post: %v", err)
+			}
+			defer resp.Body.Close()
+			io.Copy(io.Discard, resp.Body)
+
+			if resp.StatusCode != tc.want {
+				t.Errorf("status %d, want %d", resp.StatusCode, tc.want)
+			}
+		})
+	}
+
+	// The stream is a GET and stays reachable: it changes nothing, and it
+	// needs the capability anyway.
+	openStream(t, srv, sid)
+}
+
+// TestCheckOriginOverridesTheDefault, for a page served from somewhere else
+// - and for the deployment that would rather refuse the empty case, which
+// no browser produces but every other client does.
+func TestCheckOriginOverridesTheDefault(t *testing.T) {
+	h := New(func() Component { return &counter{} })
+	h.Logger = quietLogger()
+	h.CheckOrigin = func(r *http.Request) bool {
+		return r.Header.Get("Origin") == "https://friend.example"
+	}
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	page, sid := getPage(t, srv)
+	action := clickURLs(t, fragment(t, page))[0]
+
+	for origin, want := range map[string]int{
+		"https://friend.example": http.StatusNoContent,
+		srv.URL:                  http.StatusForbidden, // same origin, and still refused
+		"":                       http.StatusForbidden,
+	} {
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+action, nil)
+		req.Header.Set(SessionHeader, sid)
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != want {
+			t.Errorf("origin %q: status %d, want %d", origin, resp.StatusCode, want)
+		}
+	}
+}
+
+// TestCloseEndsTheSessionAndSendsThePageHome. A session outlives the
+// request that made it, so nothing about a cookie expiring reaches the
+// component tree still sitting in memory with the identity it captured at
+// mount. Close is how logging out reaches it.
+//
+// The recovery is the existing one rather than a second mechanism: the
+// stream ends, Datastar reconnects, the server no longer has that session,
+// and the page gets the same reload a restart would give it - back through
+// whatever middleware fronts the handler.
+func TestCloseEndsTheSessionAndSendsThePageHome(t *testing.T) {
+	h := New(func() Component { return &counter{} })
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	_, sid := getPage(t, srv)
+	stream := openStream(t, srv, sid)
+
+	if !h.Close(sid) {
+		t.Fatal("Close reported no session to close")
+	}
+	if _, ok := h.sessions.get(sid); ok {
+		t.Error("the session is still registered after Close")
+	}
+	// Closing a session it does not have is not an error, so a logout racing
+	// a closed tab does not need special-casing.
+	if h.Close(sid) {
+		t.Error("Close reported closing the same session twice")
+	}
+
+	// The stream ended rather than hanging, so the browser retries.
+	waitFor(t, time.Second, func() bool { return stream.ended() }, "the stream to end")
+
+	reconnect, err := http.NewRequest(http.MethodGet, srv.URL+routePrefix+"/live", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconnect.Header.Set(SessionHeader, sid)
+	resp, err := srv.Client().Do(reconnect)
+	if err != nil {
+		t.Fatalf("reconnect: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "location.reload()") {
+		t.Errorf("the reconnect did not send the page home: %q", body)
+	}
+}
+
+// TestOwnerIsSetFromMount is the flow the README documents: middleware puts
+// the user in the request context, Mount reads it there and labels the
+// session, and logging out finds the page by that label.
+func TestOwnerIsSetFromMount(t *testing.T) {
+	h := New(func() Component { return &owned{} })
+	h.Logger = quietLogger()
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	_, sid := getPage(t, srv)
+
+	sess, ok := h.sessions.get(sid)
+	if !ok {
+		t.Fatal("no session")
+	}
+	if got := sess.Owner(); got != "ada" {
+		t.Fatalf("Owner = %q, want the label Mount set", got)
+	}
+	if n := h.CloseOwner("ada"); n != 1 {
+		t.Errorf("CloseOwner found %d sessions, want 1", n)
+	}
+}
+
+// owned labels itself the way a component behind authentication would.
+type owned struct{ Base }
+
+func (o *owned) Mount(context.Context, Params) error {
+	// The real one reads this off the request context; what matters here is
+	// that Session() is usable from Mount at all.
+	o.Session().SetOwner("ada")
+	return nil
+}
+
+func (o *owned) Render(context.Context) templ.Component {
+	return templ.Raw(`<p id="owned">yes</p>`)
+}
+
+// TestCloseOwnerEndsEveryPageOfTheirs, because one person logging out has
+// however many tabs they left open, and each is its own session.
+func TestCloseOwnerEndsEveryPageOfTheirs(t *testing.T) {
+	h := New(func() Component { return &counter{} })
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	var theirs []string
+	for range 3 {
+		_, sid := getPage(t, srv)
+		sess, _ := h.sessions.get(sid)
+		sess.SetOwner("ada")
+		theirs = append(theirs, sid)
+	}
+	_, somebodyElse := getPage(t, srv)
+	other, _ := h.sessions.get(somebodyElse)
+	other.SetOwner("grace")
+
+	// And one nobody labelled, which is the case that makes the empty owner
+	// dangerous: matching "" would log out every page in the process.
+	_, unlabelled := getPage(t, srv)
+
+	if n := h.CloseOwner(""); n != 0 {
+		t.Errorf("CloseOwner(\"\") closed %d sessions, want 0", n)
+	}
+	if _, ok := h.sessions.get(unlabelled); !ok {
+		t.Fatal("an unlabelled session was closed by the empty owner")
+	}
+
+	if n := h.CloseOwner("ada"); n != 3 {
+		t.Errorf("CloseOwner closed %d sessions, want 3", n)
+	}
+	for _, sid := range theirs {
+		if _, ok := h.sessions.get(sid); ok {
+			t.Errorf("session %s survived its owner logging out", sid)
+		}
+	}
+	if _, ok := h.sessions.get(somebodyElse); !ok {
+		t.Error("logging one person out closed somebody else's page")
+	}
 }
 
 // TestUnattachedSessionIsCollected: a page loaded and abandoned - a crawler,

@@ -11,11 +11,9 @@ import (
 // button, and the state of its own connection.
 //
 // It lives in shim.js rather than in a Go string so that it is JavaScript as
-// far as an editor, a formatter and a linter are concerned - and so that
-// nothing in it has to be escaped for Go's sake. What used to be a Sprintf
-// template with a doubled %% in it is now one generated call at the bottom
-// of the script, which is also the only thing about the shim that varies per
-// session.
+// far as an editor, a formatter and a linter are concerned, and so that
+// nothing in it has to be escaped for Go's sake. The only part that varies
+// per session is one generated call appended at the bottom of the script.
 //
 // Connection state comes from Datastar's `datastar-fetch` event. Three
 // things about it were verified in a browser rather than assumed, and each
@@ -46,7 +44,18 @@ var shimSource string
 // global scope, so a page carrying this script gains no names of its own.
 func clientScript(s *Session) string {
 	base := s.prefix + routePrefix
-	nav, err := json.Marshal(base + "/nav/" + s.id)
+	nav, err := json.Marshal(base + "/nav")
+	if err != nil {
+		return ""
+	}
+	// The shim makes two requests Datastar does not: the popstate report and
+	// the upload. Both carry the session the same way every other one does,
+	// so it needs the id rather than a URL with the id in it.
+	sid, err := json.Marshal(s.id)
+	if err != nil {
+		return ""
+	}
+	header, err := json.Marshal(SessionHeader)
 	if err != nil {
 		return ""
 	}
@@ -64,6 +73,10 @@ func clientScript(s *Session) string {
 	b.Write(nav)
 	b.WriteString(", up: ")
 	b.Write(up)
+	b.WriteString(", sid: ")
+	b.Write(sid)
+	b.WriteString(", header: ")
+	b.Write(header)
 	b.WriteString("});\n</script>\n")
 	return b.String()
 }

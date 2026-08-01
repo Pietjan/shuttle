@@ -58,7 +58,7 @@ func TestMountedUnderAPrefix(t *testing.T) {
 	}
 
 	// Both the stream and the actions point under the prefix.
-	if !strings.Contains(page, "/dashboard/_shuttle/live/"+sid[1]) {
+	if !strings.Contains(page, "/dashboard/_shuttle/live") {
 		t.Errorf("stream URL ignores the prefix: %q", page)
 	}
 	for _, u := range clickURLs(t, fragment(t, page)) {
@@ -68,8 +68,8 @@ func TestMountedUnderAPrefix(t *testing.T) {
 	}
 
 	// And they actually work from there.
-	stream := openStreamAt(t, srv, "/dashboard/_shuttle/live/"+sid[1])
-	if code := post(t, srv, clickURLs(t, fragment(t, page))[0]); code != http.StatusNoContent {
+	stream := openStreamAt(t, srv, sid[1], "/dashboard/_shuttle/live")
+	if code := post(t, srv, sid[1], clickURLs(t, fragment(t, page))[0]); code != http.StatusNoContent {
 		t.Fatalf("action under prefix: status %d", code)
 	}
 	if evt := stream.event(t); !strings.Contains(evt, `<output id="count">1</output>`) {
@@ -157,7 +157,7 @@ func TestShellGetsWhatItNeeds(t *testing.T) {
 	if got.ScriptURL != DefaultScriptURL {
 		t.Errorf("ScriptURL = %q", got.ScriptURL)
 	}
-	if !strings.HasPrefix(got.Attach, "@get('/_shuttle/live/") {
+	if !strings.HasPrefix(got.Attach, "@get('/_shuttle/live'") {
 		t.Errorf("Attach = %q", got.Attach)
 	}
 	if !strings.Contains(got.Body, `<output id="count">4</output>`) {
@@ -166,10 +166,15 @@ func TestShellGetsWhatItNeeds(t *testing.T) {
 }
 
 // openStreamAt opens the page's stream at an explicit path.
-func openStreamAt(t *testing.T, srv *httptest.Server, path string) *sseReader {
+func openStreamAt(t *testing.T, srv *httptest.Server, sid, path string) *sseReader {
 	t.Helper()
 
-	resp, err := srv.Client().Get(srv.URL + path)
+	req, err := http.NewRequest(http.MethodGet, srv.URL+path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(SessionHeader, sid)
+	resp, err := srv.Client().Do(req)
 	if err != nil {
 		t.Fatalf("open stream: %v", err)
 	}

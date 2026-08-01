@@ -181,17 +181,23 @@ func TestNavigateAndReplace(t *testing.T) {
 		t.Fatalf("render: %v", err)
 	}
 
-	if err := c.Navigate(ctx, "/?filter=mine"); err != nil {
+	// On the session's goroutine, because Navigate and Replace run
+	// HandleParams synchronously on whichever goroutine calls them - and
+	// HandleParams writes component fields, which the session is rendering
+	// from. An action is already there; a test is not.
+	if err := sess.call(func() error { return c.Navigate(ctx, "/?filter=mine") }); err != nil {
 		t.Fatalf("navigate: %v", err)
 	}
-	if c.Filter != "mine" {
-		t.Errorf("Navigate did not apply the params: filter = %q", c.Filter)
-	}
-
-	if err := c.Replace(ctx, "/?filter=theirs"); err != nil {
+	if err := sess.call(func() error {
+		if c.Filter != "mine" {
+			t.Errorf("Navigate did not apply the params: filter = %q", c.Filter)
+		}
+		return c.Replace(ctx, "/?filter=theirs")
+	}); err != nil {
 		t.Fatalf("replace: %v", err)
 	}
 
+	settle(t, sess)
 	got := scripts(sess.take())
 	if len(got) < 2 {
 		t.Fatalf("got %d history calls, want at least 2: %v", len(got), got)
@@ -215,10 +221,13 @@ func TestRedirectLeavesTheSession(t *testing.T) {
 	if _, err := sess.Render(context.Background()); err != nil {
 		t.Fatalf("render: %v", err)
 	}
-	if err := c.Redirect(context.Background(), "/login"); err != nil {
+	if err := sess.call(func() error {
+		return c.Redirect(context.Background(), "/login")
+	}); err != nil {
 		t.Fatalf("redirect: %v", err)
 	}
 
+	settle(t, sess)
 	got := scripts(sess.take())
 	if len(got) != 1 || !strings.Contains(got[0], `window.location.href = "/login"`) {
 		t.Errorf("redirect scripts = %v", got)
@@ -241,12 +250,12 @@ func TestBackButtonReachesTheServer(t *testing.T) {
 	if !strings.Contains(page, "popstate") {
 		t.Error("no history shim in the page")
 	}
-	if !strings.Contains(page, routePrefix+"/nav/"+sid) {
+	if !strings.Contains(page, routePrefix+"/nav") {
 		t.Errorf("shim does not point at this session's endpoint: %q", page)
 	}
 
 	// What the shim posts when the user presses back.
-	if code := postBody(t, srv, routePrefix+"/nav/"+sid, `{"url":"/?filter=archived"}`); code != http.StatusNoContent {
+	if code := postBody(t, srv, sid, routePrefix+"/nav", `{"url":"/?filter=archived"}`); code != http.StatusNoContent {
 		t.Fatalf("nav: status %d, want 204", code)
 	}
 
@@ -271,7 +280,7 @@ func TestBackButtonDoesNotBounceTheBrowser(t *testing.T) {
 	sess, _ := h.sessions.get(sid)
 	stream := openStream(t, srv, sid)
 
-	if code := postBody(t, srv, routePrefix+"/nav/"+sid, `{"url":"/?filter=archived"}`); code != http.StatusNoContent {
+	if code := postBody(t, srv, sid, routePrefix+"/nav", `{"url":"/?filter=archived"}`); code != http.StatusNoContent {
 		t.Fatalf("nav: status %d", code)
 	}
 	stream.event(t) // the re-render
@@ -293,10 +302,13 @@ func TestNavRejectsRubbish(t *testing.T) {
 
 	_, sid := getPage(t, srv)
 
-	if code := postBody(t, srv, routePrefix+"/nav/"+sid, `{not json`); code != http.StatusBadRequest {
+	if code := postBody(t, srv, sid, routePrefix+"/nav", `{not json`); code != http.StatusBadRequest {
 		t.Errorf("bad payload: status %d, want 400", code)
 	}
-	if code := postBody(t, srv, routePrefix+"/nav/deadbeef", `{"url":"/"}`); code != http.StatusNotFound {
+	// An unknown session, named in the header rather than the path - the
+	// path form would be a routing miss and would pass without ever
+	// reaching the session lookup.
+	if code := postBody(t, srv, "deadbeef", routePrefix+"/nav", `{"url":"/"}`); code != http.StatusNotFound {
 		t.Errorf("unknown session: status %d, want 404", code)
 	}
 }

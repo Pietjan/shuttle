@@ -166,10 +166,11 @@ func TestStreamGreetsOnConnect(t *testing.T) {
 
 	_, sid := getPage(t, srv)
 
-	req, err := http.NewRequest(http.MethodGet, srv.URL+routePrefix+"/live/"+sid, nil)
+	req, err := http.NewRequest(http.MethodGet, srv.URL+routePrefix+"/live", nil)
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}
+	req.Header.Set(SessionHeader, sid)
 	resp, err := srv.Client().Do(req)
 	if err != nil {
 		t.Fatalf("open stream: %v", err)

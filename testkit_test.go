@@ -2,6 +2,7 @@ package shuttle
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"slices"
@@ -308,6 +309,115 @@ func TestAssertionsPassWhenTheyShould(t *testing.T) {
 	if f := r.failures(); f != "" {
 		t.Errorf("assertions failed on a healthy component:\n%s", f)
 	}
+}
+
+// TestKitFiresASubmit. The change/submit split is a form's whole shape, so
+// a kit that could only click would leave the committing half untestable.
+func TestKitFiresASubmit(t *testing.T) {
+	live := Test(t, &subscribe{})
+	live.Assert().Text("#sent", "0")
+
+	live.Submit("#shuttle-c-join")
+	live.Assert().Text("#sent", "1")
+}
+
+// subscribe renders its own <form>, which is what OnSubmit is for - Loom
+// has no form component, and the binding is generic over any package's
+// option type rather than only Loom's.
+type subscribe struct {
+	Base
+	Sent int
+}
+
+// formOpts is the option type of a package that is not Loom's, and
+// formAttr its Attrs: the pair the generic bindings infer from.
+type formOpts struct{ attrs string }
+
+func formAttr(key string, val ...string) func(*formOpts) {
+	return func(o *formOpts) {
+		if len(val) == 0 {
+			o.attrs += " " + key
+			return
+		}
+		o.attrs += fmt.Sprintf(" %s=%q", key, val[0])
+	}
+}
+
+func (s *subscribe) Render(ctx context.Context) templ.Component {
+	var o formOpts
+	OnSubmit(ctx, formAttr, func(context.Context) error {
+		s.Sent++
+		return nil
+	})(&o)
+	id := ElementID(ctx, "join")
+
+	return templ.ComponentFunc(func(_ context.Context, w io.Writer) error {
+		_, err := fmt.Fprintf(w,
+			`<form id=%q%s><button>join</button></form><p id="sent">%d</p>`,
+			id, o.attrs, s.Sent)
+		return err
+	})
+}
+
+// TestKitPatchesCarryWhatIsNotInTheMarkup: a stream patches its container
+// rather than re-rendering the component, so a test asserting on HTML alone
+// would never see a streamed item. Patches is how those are asserted on.
+func TestKitPatchesCarryWhatIsNotInTheMarkup(t *testing.T) {
+	live := Test(t, &feed{})
+	live.Click("button")
+
+	var streamed string
+	for _, p := range live.Patches() {
+		if strings.Contains(p, `id="shuttle-c-log-1"`) {
+			streamed = p
+		}
+	}
+	if streamed == "" {
+		t.Fatalf("no streamed item in the patches: %q", live.HTML())
+	}
+	if !strings.Contains(streamed, "posted") {
+		t.Errorf("streamed item = %q, want it to carry the text", streamed)
+	}
+
+	// Patches drains, so a second action's patches are its own rather than
+	// everything the session has ever pushed.
+	if got := live.Patches(); len(got) != 0 {
+		t.Errorf("Patches returned %d patches again, want it to have drained", len(got))
+	}
+	live.Click("button")
+	if got := live.Patches(); len(got) == 0 {
+		t.Error("the second action's patches were lost")
+	}
+}
+
+// TestKitReportsAFailingAction. The action runs on the session's goroutine,
+// so an error it returns has nowhere to surface on its own - without this
+// the test would carry on and fail later on an assertion, naming the wrong
+// thing.
+func TestKitReportsAFailingAction(t *testing.T) {
+	r := &recorder{}
+	live := Test(r, &brittle{})
+	defer r.done()
+
+	live.Click("button")
+
+	if len(r.fatals) == 0 {
+		t.Fatal("an action that returned an error did not fail the test")
+	}
+	if !strings.Contains(r.fatals[0], "acting") || !strings.Contains(r.fatals[0], "no") {
+		t.Errorf("failure does not say what went wrong: %q", r.fatals[0])
+	}
+}
+
+type brittle struct{ Base }
+
+func (b *brittle) Render(ctx context.Context) templ.Component {
+	boom := button.New(OnClick(ctx, button.Attr, func(context.Context) error {
+		return errors.New("no")
+	}))
+	return templ.ComponentFunc(func(ctx context.Context, w io.Writer) error {
+		return boom.Render(templ.WithChildren(ctx, templ.Raw("boom")), w)
+	})
 }
 
 // TestKitCatchesDuplicateIDs, the failure Datastar reports nothing about.

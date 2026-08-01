@@ -114,7 +114,12 @@ func (b *Base) Every(d time.Duration, fn func(context.Context) error) error {
 //
 // It returns once the work is queued, not once it has run, so it is safe to
 // call from anywhere - including from inside an action, where waiting would
-// be waiting on itself.
+// be waiting on itself. The trade is that fn's error has nowhere to go but
+// the handler's logger, since the caller is long past by the time it runs.
+//
+// It is also the wrapper for the three methods that must not be called off
+// the session's goroutine - [Base.Navigate], [Base.Replace] and [Base.Emit],
+// each of which runs another component's handler inline.
 func (b *Base) Do(fn func(context.Context) error) error {
 	if b.n == nil {
 		return ErrNotMounted
@@ -134,8 +139,15 @@ func (b *Base) Do(fn func(context.Context) error) error {
 
 // Member is one participant on a presence topic.
 type Member struct {
-	// Session is the id of the page the member is connected on.
-	Session string
+	// Tag identifies the page the member is connected on, and is the
+	// session's [Session.Tag] rather than its id.
+	//
+	// That distinction is the whole reason this field is named as it is. A
+	// roster goes to every subscriber on the topic, so a member carrying the
+	// session id would hand each page the capability for all the others -
+	// and rendering the roster, which is what a roster is for, would print
+	// them into the markup. A tag names a page without unlocking it.
+	Tag string
 	// Meta is whatever the caller attached at join - a user id, a name.
 	Meta any
 }
@@ -162,7 +174,7 @@ func newPresence() *presence {
 	return &presence{topics: map[string]map[string]Member{}}
 }
 
-func (p *presence) join(topic, session string, meta any) (Member, bool) {
+func (p *presence) join(topic, tag string, meta any) (Member, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -171,13 +183,13 @@ func (p *presence) join(topic, session string, meta any) (Member, bool) {
 		members = map[string]Member{}
 		p.topics[topic] = members
 	}
-	m := Member{Session: session, Meta: meta}
-	_, rejoin := members[session]
-	members[session] = m
+	m := Member{Tag: tag, Meta: meta}
+	_, rejoin := members[tag]
+	members[tag] = m
 	return m, !rejoin
 }
 
-func (p *presence) leave(topic, session string) (Member, bool) {
+func (p *presence) leave(topic, tag string) (Member, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -185,11 +197,11 @@ func (p *presence) leave(topic, session string) (Member, bool) {
 	if !ok {
 		return Member{}, false
 	}
-	m, ok := members[session]
+	m, ok := members[tag]
 	if !ok {
 		return Member{}, false
 	}
-	delete(members, session)
+	delete(members, tag)
 	if len(members) == 0 {
 		delete(p.topics, topic)
 	}
@@ -205,7 +217,7 @@ func (p *presence) list(topic string) []Member {
 		members = append(members, m)
 	}
 	sort.Slice(members, func(i, j int) bool {
-		return members[i].Session < members[j].Session
+		return members[i].Tag < members[j].Tag
 	})
 	return members
 }
@@ -228,9 +240,9 @@ func (b *Base) Join(ctx context.Context, topic string, meta any) error {
 	}
 
 	sess := b.n.sess
-	member, fresh := sess.presence().join(topic, sess.id, meta)
+	member, fresh := sess.presence().join(topic, sess.Tag(), meta)
 	b.n.onClose(func() {
-		if m, ok := sess.presence().leave(topic, sess.id); ok {
+		if m, ok := sess.presence().leave(topic, sess.Tag()); ok {
 			_ = sess.broker.Publish(context.Background(), topic,
 				PresenceEvent{Topic: topic, Member: m, Joined: false})
 		}
@@ -243,7 +255,7 @@ func (b *Base) Join(ctx context.Context, topic string, meta any) error {
 		PresenceEvent{Topic: topic, Member: member, Joined: true})
 }
 
-// Presence returns who is currently on a topic, ordered by session id.
+// Presence returns who is currently on a topic, ordered by member tag.
 func (b *Base) Presence(topic string) []Member {
 	if b.n == nil {
 		return nil

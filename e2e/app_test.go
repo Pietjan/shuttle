@@ -380,10 +380,9 @@ func (c *ticker) Render(_ context.Context) templ.Component {
 	})
 }
 
-// TestUnmountedComponentStopsPatching. This is the bug that was found by
-// noticing a console error, which is exactly the kind of thing a server-side
-// test cannot see: the server sends the patch happily and the client drops
-// it with a warning nobody hears.
+// TestUnmountedComponentStopsPatching, which only a browser can check: the
+// server sends a patch for a missing element happily, and the client drops
+// it with a console warning nobody server-side ever hears.
 func TestUnmountedComponentStopsPatching(t *testing.T) {
 	p := open(t, func() shuttle.Component { return &switcher{} })
 

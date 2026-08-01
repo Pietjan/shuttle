@@ -65,11 +65,13 @@ func (sc *scope) register(fn Action) string {
 // component as well as the action, because tables are per component now -
 // and it is scoped so the request uploads this component's signals and
 // nothing else.
+// The session travels in a header rather than the path - see
+// [SessionHeader] - so the URL names only what is being acted on.
 func (sc *scope) actionExpr(actionID string) string {
 	sess := sc.node.sess
-	return fmt.Sprintf(`@post('%s/act/%s/%s/%s', %s)`,
-		sess.prefix+routePrefix, sess.id, sc.path().nodeID(), actionID,
-		filterFor(sc.path().namespace()))
+	return fmt.Sprintf(`@post('%s/act/%s/%s', {headers: %s, %s})`,
+		sess.prefix+routePrefix, sc.path().nodeID(), actionID,
+		sessionHeaderExpr(sess), filterFor(sc.path().namespace()))
 }
 
 // OnEvent binds a DOM event to a server-side closure, returning one option
