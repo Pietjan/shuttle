@@ -5,6 +5,8 @@ import (
 	"strings"
 
 	"golang.org/x/net/html"
+
+	"github.com/starfederation/datastar-go/datastar"
 )
 
 // A small selector engine, enough to write assertions against a component's
@@ -174,14 +176,22 @@ func selectAll(markup, sel string) ([]*html.Node, error) {
 	return found, nil
 }
 
-// applyPatch replaces the element carrying id with replacement, which is
-// what the browser's morph does when a patch arrives.
+// applyPatch applies one patch to the kit's copy of the page, the way the
+// browser would.
 //
 // The testing kit needs it because a scoped re-render is the normal case: an
 // action on a child patches only that child, so tracking the root's markup
 // alone would leave every assertion looking at the render before the one
 // that just happened.
-func applyPatch(markup, id, replacement string) (string, bool) {
+//
+// The mode is honoured rather than assumed, and that is not thoroughness for
+// its own sake. A stream's append names the *container* as its target and
+// carries one item as its markup, so treating every patch as an outer
+// replace does not merely miss the item - it swaps the whole container for
+// it. A component that streams anything would then have its markup quietly
+// dismantled part way through a test, and every assertion after that point
+// would be about a document the browser never had.
+func applyPatch(markup, id, replacement string, mode datastar.ElementPatchMode) (string, bool) {
 	doc, err := html.Parse(strings.NewReader(markup))
 	if err != nil {
 		return markup, false
@@ -191,22 +201,139 @@ func applyPatch(markup, id, replacement string) (string, bool) {
 	if target == nil || target.Parent == nil {
 		return markup, false
 	}
-	parent := target.Parent
 
-	nodes, err := html.ParseFragment(strings.NewReader(replacement), parent)
-	if err != nil {
-		return markup, false
+	switch mode {
+	case datastar.ElementPatchModeRemove:
+		target.Parent.RemoveChild(target)
+
+	case datastar.ElementPatchModeInner:
+		nodes, ok := parseIn(target, replacement)
+		if !ok {
+			return markup, false
+		}
+		for c := target.FirstChild; c != nil; c = target.FirstChild {
+			target.RemoveChild(c)
+		}
+		place(target, nodes, nil)
+
+	case datastar.ElementPatchModeAppend:
+		nodes, ok := parseIn(target, replacement)
+		if !ok {
+			return markup, false
+		}
+		place(target, nodes, nil)
+
+	case datastar.ElementPatchModePrepend:
+		nodes, ok := parseIn(target, replacement)
+		if !ok {
+			return markup, false
+		}
+		place(target, nodes, target.FirstChild)
+
+	default: // outer, which is what a re-render is
+		parent := target.Parent
+		nodes, ok := parseIn(parent, replacement)
+		if !ok {
+			return markup, false
+		}
+		nodes = keepIgnored(doc, nodes)
+		place(parent, nodes, target)
+		parent.RemoveChild(target)
 	}
-	for _, n := range nodes {
-		parent.InsertBefore(n, target)
-	}
-	parent.RemoveChild(target)
 
 	body := findBody(doc)
 	if body == nil {
 		return markup, false
 	}
 	return innerHTML(body)
+}
+
+// parseIn parses fragment in the context of parent.
+//
+// Parsing in context is what makes a streamed <li> land as an <li>: parsed
+// against a <ul> it is one, parsed against nothing the tokeniser drops the
+// tag and keeps only the text.
+func parseIn(parent *html.Node, fragment string) ([]*html.Node, bool) {
+	nodes, err := html.ParseFragment(strings.NewReader(fragment), parent)
+	if err != nil {
+		return nil, false
+	}
+	return nodes, true
+}
+
+// place puts nodes before before, or at the end when before is nil.
+func place(parent *html.Node, nodes []*html.Node, before *html.Node) {
+	for _, n := range nodes {
+		if before != nil {
+			parent.InsertBefore(n, before)
+			continue
+		}
+		parent.AppendChild(n)
+	}
+}
+
+// keepIgnored carries data-ignore-morph containers over from the live
+// document into an incoming render, subtree and all.
+//
+// Without it the kit models a morph that does not exist. Datastar skips a
+// pair of elements outright when both carry the attribute - read from the
+// v1.0.2 bundle, where the morph returns immediately if the old and the new
+// element both have it, or if the old one sits inside something that does -
+// so a component's re-render cannot disturb what was streamed into its
+// container.
+//
+// A kit that overwrote the container instead would lose every streamed item
+// on the component's next render. Not visibly, either: the test would go on
+// passing until it asserted on something streamed a while ago, and then
+// report that the browser had lost it, which is the opposite of what
+// happens.
+func keepIgnored(doc *html.Node, incoming []*html.Node) []*html.Node {
+	const ignore = "data-ignore-morph"
+
+	// Collected first, then swapped: the swap detaches nodes, and moving
+	// the tree around while walking it reads worse than it works.
+	type swap struct{ from, to *html.Node }
+	var swaps []swap
+
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode {
+			if id := attr(n, "id"); id != "" {
+				if _, ok := lookupAttr(n, ignore); ok {
+					if live := findByID(doc, id); live != nil {
+						if _, ok := lookupAttr(live, ignore); ok {
+							swaps = append(swaps, swap{from: n, to: live})
+						}
+					}
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	for _, n := range incoming {
+		walk(n)
+	}
+
+	for _, s := range swaps {
+		if s.to.Parent != nil {
+			s.to.Parent.RemoveChild(s.to)
+		}
+		if s.from.Parent != nil {
+			s.from.Parent.InsertBefore(s.to, s.from)
+			s.from.Parent.RemoveChild(s.from)
+			continue
+		}
+		// A top-level node of the fragment: it has no parent to swap it
+		// out of, so the caller's slice is what has to change.
+		for i, n := range incoming {
+			if n == s.from {
+				incoming[i] = s.to
+			}
+		}
+	}
+	return incoming
 }
 
 func findByID(n *html.Node, id string) *html.Node {

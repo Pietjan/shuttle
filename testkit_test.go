@@ -484,3 +484,30 @@ func TestTextIsCollapsed(t *testing.T) {
 		t.Errorf("textOf = %q, want %q", got, "hello world")
 	}
 }
+
+// TestTheKitModelsAStreamTheWayTheBrowserDoes covers two things the kit
+// used to get wrong, both of which made a streaming component untestable
+// without anyone being told.
+//
+// A stream's append names the container and carries one item, so applying
+// every patch as an outer replace swapped the container for the item -
+// after which every later assertion was about a document the browser never
+// had. And the component's own re-render then overwrote the container, so
+// items streamed before it disappeared, which is precisely what
+// data-ignore-morph exists to prevent.
+func TestTheKitModelsAStreamTheWayTheBrowserDoes(t *testing.T) {
+	live := Test(t, &feed{})
+
+	live.Click("button")
+	live.Assert().
+		Text("#sent", "1").
+		Exists("ul#shuttle-c-log").
+		Count("ul li", 1)
+
+	// The second click re-renders the component as well as appending, and
+	// the first item has to survive that.
+	live.Click("button")
+	live.Assert().
+		Text("#sent", "2").
+		Count("ul li", 2)
+}

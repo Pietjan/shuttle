@@ -327,6 +327,30 @@ thing while activating it does another.
 The view lives in the URL, so it can be shared, survives a reload, and comes back after a restart —
 which is the same mechanism reconnect recovery relies on.
 
+**Feed** — infinite scroll over a set the server owns, reading the same `Query` and `Page` a table
+does, so one data source backs either:
+
+```go
+&live.Feed[Post]{Load: loadPosts, Item: func(p Post) templ.Component { return live.Text(p.Title) }}
+```
+
+A feed is where server-held state would get expensive, so this one **holds a page, not a scrollback**:
+the first page is rendered into the document, every page after it is streamed into the browser an
+item at a time and forgotten here, and the container carries `data-ignore-morph` so the component's
+own re-renders leave what was streamed alone. `Loaded()` is what the reader has, `Held()` is what
+this process is keeping — the gap between them is the whole design.
+
+The trade is the one streams always make: nothing on the server can rebuild that list, so a reload
+starts at the first page again. Call `Reset` when whatever `Load` closes over changes; it clears the
+container and streams the new first page, because markup written into an ignored container never
+arrives.
+
+`shuttle.OnIntersect` is the binding underneath it, for a sentinel of your own. Note the attribute is
+`data-on-intersect`, hyphenated and keyless — in Datastar v1 this is a plugin in its own right rather
+than an event name, so `data-on:intersect` is an error. It fires **every** time the element comes
+into view, and a page that leaves it on screen will be asked for another one, so stop rendering it
+when there is nothing left to load.
+
 ## Testing your components
 
 `shuttle.Test` drives mount → action → render with no browser and no HTTP server:
@@ -344,10 +368,16 @@ func TestTodo(t *testing.T) {
 }
 ```
 
-`Click`, `Submit`, `Change` fire bindings; `Signal` sets client state the action will carry;
-`Params` changes the URL the way a filter or the back button would; `Publish` delivers a pub/sub
-message so `HandleInfo` can be tested without a second page. `Patches()` returns what was pushed,
-for streams and server pushes.
+`Click`, `Submit`, `Change` and `Intersect` fire bindings; `Signal` sets client state the action will
+carry; `Params` changes the URL the way a filter or the back button would; `Publish` delivers a
+pub/sub message so `HandleInfo` can be tested without a second page. `Patches()` returns what was
+pushed, for streams and server pushes.
+
+The kit applies every patch the way the browser would, modes included, so a component that streams
+can be asserted on as a document rather than as a list of patches: an append lands inside its
+container, and a `data-ignore-morph` container keeps what was streamed into it across the
+component's own re-renders. What it cannot do is decide what is on screen — whether a feed keeps
+loading until the viewport is full is a browser's answer, so `Intersect` fires once per call.
 
 Assertions take a small selector — tags, `#id`, `.class`, `[attr=value]`, and descendants — and
 each reports rather than stopping, so one failure doesn't hide the next. **`NoDuplicateIDs` is
@@ -526,9 +556,31 @@ through your middleware, which is now the thing saying no. `Handler.Close(sid)` 
 default, `RequestRate` and `RequestBurst` to change it, a negative rate to turn it off. It refills
 continuously rather than resetting, so a page open all day is in the same position as one just
 opened, and it is checked before anything is decoded or queued. It bounds what *one page* can do to
-your database, your third-party APIs and, through pub/sub, everyone else's session. It is not a
-defence against an anonymous flood: a session id is free to anyone who loads the page, so put a
-per-IP limit in front of the page route as well.
+your database, your third-party APIs and, through pub/sub, everyone else's session.
+
+**Page loads draw on a second budget, per client** — 1/second with a burst of 10, `PageRate` and
+`PageBurst` to change it. This is the limit the session budget cannot be: the page route is where
+sessions come from, so a caller refused by one session's bucket simply takes another. Each load
+mounts a component tree and keeps it, and while the registry's cap of 10,000 sessions stops that
+from exhausting memory, a cap is not fairness — one client can hold every slot and lock everybody
+else out. Refused loads never reach your factory.
+
+It has to know who the client is, and by default that is the address the connection came from.
+**Behind a reverse proxy that is the proxy**, which makes the whole site one bucket:
+
+```go
+handler.ClientIP = shuttle.ForwardedClientIP(1)   // one trusted proxy in front
+```
+
+`ForwardedClientIP` counts `X-Forwarded-For` from the *end*, since a proxy appends and everything
+before its entry is whatever the client sent — reading the leftmost entry is not a limit at all.
+Getting the hop count wrong degrades rather than opens. `ClientIP` can return anything that
+identifies a caller and that the caller cannot choose freely, such as an account id. IPv6 is charged
+per /64, because the smallest allocation anyone gets is a /64 and a limit per address is a limit per
+attempt.
+
+Neither budget is a defence against a distributed flood; that belongs at your edge, and a negative
+rate turns either off if it already lives there.
 
 Actions carry at most `MaxSignalBytes` (64 KiB) of JSON. Internal errors never reach the client —
 the response gets the status, the log gets the cause — so read your logs when a component fails.
@@ -538,12 +590,10 @@ the response gets the status, the log gets the cause — so read your logs when 
 Built and tested: sessions and transport, deterministic ids and per-instance signal namespacing,
 forms with the change/submit split, nested components with scoped re-render, pub/sub, timers,
 presence, streams, navigation with URL binding, a testing kit, connection recovery, file uploads,
-and the live component kit. The parts only a browser can settle — the morph rules, popover
-dismissal, reconnection, upload progress — are covered by an end-to-end suite rather than by
+per-session and per-client rate limiting, and the live component kit — combobox, table and infinite
+scroll. The parts only a browser can settle — the morph rules, popover dismissal, reconnection,
+upload progress, whether a feed keeps loading — are covered by an end-to-end suite rather than by
 assertion here.
-
-Not built yet: per-IP rate limiting, which has to sit in front of the page route since a session
-does not exist yet at that point, and infinite scroll.
 
 Server-held state means sticky routing and memory sizing per connected tab. Plan for both before
 putting this in front of real traffic.

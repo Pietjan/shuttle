@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"golang.org/x/net/html"
+
+	"github.com/starfederation/datastar-go/datastar"
 )
 
 // The testing kit drives a component the way the transport does - mount,
@@ -142,6 +144,21 @@ func (l *Live) Change(sel string) *Live {
 	return l.fire("input", sel)
 }
 
+// Intersect fires the handler for the first element matching sel scrolling
+// into view - the trigger behind infinite scroll, and the one binding a
+// test cannot reach by naming a DOM event, since it is its own Datastar
+// plugin rather than an event name.
+//
+// What it cannot stand in for is the re-arm: in a browser, the sentinel
+// fires again by itself whenever a render leaves it on screen, and only a
+// browser knows what is on screen. Call it once per page you expect to be
+// loaded, and leave "does it keep loading until the viewport is full" to
+// the end-to-end suite.
+func (l *Live) Intersect(sel string) *Live {
+	l.tb.Helper()
+	return l.fireAttr("data-on-intersect", "intersect", sel)
+}
+
 // Publish sends a message through the session's broker, so a component's
 // HandleInfo can be tested without a second page.
 func (l *Live) Publish(topic string, msg any) *Live {
@@ -171,8 +188,16 @@ func (l *Live) Patches() []string {
 // actionRE finds a binding's endpoint in a rendered attribute.
 var actionRE = regexp.MustCompile(`@post\('([^']*)'`)
 
-// fire finds the element's binding for an event and invokes it.
+// fire finds the element's binding for a DOM event and invokes it.
 func (l *Live) fire(event, sel string) *Live {
+	l.tb.Helper()
+	return l.fireAttr("data-on:"+event, event, sel)
+}
+
+// fireAttr invokes the action bound to one attribute. The attribute is a
+// parameter because not every trigger is the "on" plugin with an event key;
+// what is being simulated is passed alongside it, for the failure message.
+func (l *Live) fireAttr(want, what, sel string) *Live {
 	l.tb.Helper()
 
 	node := l.first(sel)
@@ -183,7 +208,6 @@ func (l *Live) fire(event, sel string) *Live {
 
 	// The attribute may carry modifiers - data-on:input__debounce.300ms -
 	// so match on the prefix rather than the whole name.
-	want := "data-on:" + event
 	expr := ""
 	for _, a := range node.Attr {
 		if a.Key == want || strings.HasPrefix(a.Key, want+"__") {
@@ -192,13 +216,13 @@ func (l *Live) fire(event, sel string) *Live {
 		}
 	}
 	if expr == "" {
-		l.tb.Fatalf("shuttle: %q has no %s binding (attributes: %s)", sel, event, attrNames(node))
+		l.tb.Fatalf("shuttle: %q has no %s binding (attributes: %s)", sel, what, attrNames(node))
 		return l
 	}
 
 	m := actionRE.FindStringSubmatch(expr)
 	if m == nil {
-		l.tb.Fatalf("shuttle: %q's %s binding is not a server action: %s", sel, event, expr)
+		l.tb.Fatalf("shuttle: %q's %s binding is not a server action: %s", sel, what, expr)
 		return l
 	}
 
@@ -264,15 +288,25 @@ func (l *Live) settle() {
 
 	for _, p := range l.sess.take() {
 		switch {
-		case p.target == l.sess.RootID():
-			l.markup = p.html
-		case p.html != "":
-			// A scoped re-render: a child patched itself, so splice it in
-			// the way the browser's morph would. Without this an assertion
-			// after an action on a child would still be looking at the
+		case p.script != "":
+			// Nothing to apply: navigation travels down the stream as a
+			// script rather than as markup.
+		default:
+			// Every patch lands where the browser would put it: a child
+			// splicing in its own re-render, or a stream operation adding,
+			// replacing or removing one item of a container. Without this
+			// an assertion after an action would still be looking at the
 			// render before it.
-			if merged, ok := applyPatch(l.markup, p.target, p.html); ok {
+			//
+			// The root's own re-render goes through the same path rather
+			// than replacing the markup wholesale, because that is the one
+			// patch that has to leave data-ignore-morph containers alone -
+			// and the shortcut is what would throw away everything a
+			// component had streamed into one.
+			if merged, ok := applyPatch(l.markup, p.target, p.html, p.mode); ok {
 				l.markup = merged
+			} else if p.target == l.sess.RootID() && p.mode == datastar.ElementPatchModeOuter {
+				l.markup = p.html
 			}
 		}
 		l.patches = append(l.patches, p)

@@ -132,6 +132,15 @@ func examples() []Example {
 			New: func() shuttle.Component { return &Log{} },
 		},
 		{
+			Slug: "feed", Title: "Infinite scroll", File: "feed.go",
+			Icon: icon.Infinity,
+			Blurb: "Six hundred rows the reader can scroll through, eight of " +
+				"them on the server. Pages after the first are streamed into " +
+				"the browser and forgotten here.",
+			Hint: "Scroll to the bottom and watch the count beside it.",
+			New:  func() shuttle.Component { return &Activity{} },
+		},
+		{
 			Slug: "upload", Title: "File upload", File: "upload.go",
 			Icon: icon.UploadSimple,
 			Blurb: "Its own request, because the stream only goes one way and fetch " +
