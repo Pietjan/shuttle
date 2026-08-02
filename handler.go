@@ -162,8 +162,41 @@ type Handler struct {
 	// It is not a defence against an anonymous flood: a session id is free
 	// to anybody who loads the page, so an attacker takes a fresh one rather
 	// than emptying a bucket. What it bounds is what one page can do.
+	// PageRate is what bounds how many pages there are.
 	RequestRate  float64
 	RequestBurst float64
+
+	// PageRate is how many page loads per second one client earns back, and
+	// PageBurst the most it may load at once. Zero means the defaults; a
+	// negative PageRate turns the limit off.
+	//
+	// This is the limit the request budget cannot be: the page route is
+	// where sessions come from, so a caller refused by a session's bucket
+	// only has to take another session. A page load mounts a component
+	// tree and keeps it, so a client looping over the page route holds
+	// every slot in the registry and locks everybody else out - denial of
+	// service assembled from requests that are each entirely legitimate.
+	//
+	// It is charged per client rather than per session, which means it
+	// depends on knowing who the client is. See ClientIP: behind a reverse
+	// proxy the default charges the proxy, and one bucket for the whole
+	// internet is not a limit anybody wants.
+	PageRate  float64
+	PageBurst float64
+
+	// ClientIP says who a page load is charged to. Nil reads the address
+	// the connection came from, which is right for a handler exposed
+	// directly and wrong for every handler behind a proxy: there, every
+	// request appears to come from the proxy, so the whole site shares one
+	// bucket and PageRate becomes a limit on the server rather than on a
+	// client. [ForwardedClientIP] is the answer for that case.
+	//
+	// It does not have to return an address. Anything that identifies a
+	// caller works - an account id from a session cookie, a tenant, an API
+	// key - and is used verbatim as the bucket's key. Whatever it returns
+	// must be something the caller cannot choose freely, or the limit is
+	// one bucket per attempt.
+	ClientIP func(r *http.Request) string
 
 	// MaxSignalBytes caps the JSON body an action may carry. Zero means
 	// DefaultMaxSignalBytes.
@@ -187,6 +220,10 @@ type Handler struct {
 	factory  func() Component
 	sessions *registry
 	presence *presence
+
+	// pages is the per-client page budget. A value rather than a pointer so
+	// that it needs nothing from New: its map is built on first use.
+	pages clients
 
 	// routes is built on the first request, so Prefix can be set after New.
 	once   sync.Once
@@ -267,12 +304,12 @@ func (h *Handler) mux() *http.ServeMux {
 			// session can be a whole site. Only safe because the app routed
 			// here deliberately: mounted at the server root it would mint a
 			// session for every /favicon.ico a crawler tries.
-			m.HandleFunc("GET "+base+"/", h.servePage)
+			m.HandleFunc("GET "+base+"/", h.metered(h.servePage))
 		} else {
 			// Exactly the mount point. A catch-all mints a session for every
 			// stray GET, and each one costs a component tree until it is
 			// collected.
-			m.HandleFunc("GET "+base+"/{$}", h.servePage)
+			m.HandleFunc("GET "+base+"/{$}", h.metered(h.servePage))
 		}
 		h.routes = m
 	})
