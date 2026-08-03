@@ -187,7 +187,7 @@ func ForwardedClientIP(hops int) func(*http.Request) string {
 		// header rather than extending one, and the two are equivalent.
 		var chain []string
 		for _, v := range r.Header.Values("X-Forwarded-For") {
-			for _, part := range strings.Split(v, ",") {
+			for part := range strings.SplitSeq(v, ",") {
 				if s := strings.TrimSpace(part); s != "" {
 					chain = append(chain, s)
 				}
@@ -236,10 +236,7 @@ func (h *Handler) metered(next http.HandlerFunc) http.HandlerFunc {
 // retryAfter is how long until one token is back, rounded up and never less
 // than the second the header can express.
 func retryAfter(rate float64) string {
-	secs := int(math.Ceil(1 / rate))
-	if secs < 1 {
-		secs = 1
-	}
+	secs := max(int(math.Ceil(1/rate)), 1)
 	return strconv.Itoa(secs)
 }
 

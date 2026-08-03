@@ -191,7 +191,7 @@ func (t *Table[T]) HandleParams(ctx context.Context, p shuttle.Params) error {
 	t.query.Desc = p.Get("dir") == "desc"
 
 	t.hidden = map[string]bool{}
-	for _, key := range strings.Split(p.Get("hide"), ",") {
+	for key := range strings.SplitSeq(p.Get("hide"), ",") {
 		if key != "" {
 			t.hidden[key] = true
 		}

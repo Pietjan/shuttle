@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"slices"
 	"sync"
 
 	"github.com/a-h/templ"
@@ -296,8 +297,8 @@ func (n *node) close(ctx context.Context) {
 
 	// Subscriptions and timers first: neither should be able to deliver
 	// into a component that is being unmounted.
-	for i := len(cleanup) - 1; i >= 0; i-- {
-		cleanup[i]()
+	for _, c := range slices.Backward(cleanup) {
+		c()
 	}
 
 	n.sess.unregister(n)

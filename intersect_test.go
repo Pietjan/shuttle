@@ -142,11 +142,11 @@ func TestTheSentinelStopsBeingRenderedAtTheEnd(t *testing.T) {
 func sentinelExpr(t *testing.T, markup string) string {
 	t.Helper()
 	const key = `data-on-intersect="`
-	i := strings.Index(markup, key)
-	if i < 0 {
+	_, after, ok := strings.Cut(markup, key)
+	if !ok {
 		t.Fatalf("no sentinel in %q", markup)
 	}
-	rest := markup[i+len(key):]
+	rest := after
 	j := strings.Index(rest, `"`)
 	if j < 0 {
 		t.Fatalf("unterminated attribute in %q", markup)
