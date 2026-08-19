@@ -64,6 +64,14 @@ type Session struct {
 	// accumulating them. This is the fat-morph idiom paying for
 	// backpressure.
 	pending map[string]string
+	// sent remembers the last markup queued for each component, so a
+	// re-render that produced identical bytes is dropped rather than
+	// pushed. Timer-driven components re-render every tick whether or not
+	// their state moved; without this each of those ticks is a patch the
+	// morph applies for nothing - and any element whose style a data-attr
+	// binding rewrote gets that attribute reset and re-applied, once a
+	// tick, on a page where nothing changed.
+	sent map[string]string
 	// ops are stream operations, kept in order because each one is a
 	// distinct change rather than a newer version of the same state.
 	ops      []patch
@@ -105,6 +113,7 @@ func newSessionWith(id string, cmp Component, broker Broker, pres *presence, onE
 		onError: onError,
 		nodes:   map[string]*node{},
 		pending: map[string]string{},
+		sent:    map[string]string{},
 		dirty:   map[string]*node{},
 		wake:    make(chan struct{}, 1),
 		done:    make(chan struct{}),
@@ -374,6 +383,7 @@ func (s *Session) unregister(n *node) {
 	defer s.mu.Unlock()
 	delete(s.nodes, id)
 	delete(s.pending, id)
+	delete(s.sent, id)
 }
 
 // node finds a mounted component by its node id ("c", "c-1").
@@ -392,6 +402,16 @@ func (s *Session) queue(elementID, html string) error {
 		s.mu.Unlock()
 		return ErrSessionClosed
 	}
+	// An identical render needs no patch: the client already has these
+	// bytes, or a pending slot ahead of it carries them. The page's first
+	// paint is not recorded here, so the first live render always goes out
+	// - one redundant patch per component, and in exchange the map is
+	// owned entirely by the stream.
+	if s.sent[elementID] == html {
+		s.mu.Unlock()
+		return nil
+	}
+	s.sent[elementID] = html
 	s.pending[elementID] = html
 	s.mu.Unlock()
 

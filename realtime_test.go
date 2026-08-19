@@ -571,3 +571,73 @@ func (c *ticker) heard() int {
 func (c *ticker) Render(context.Context) templ.Component {
 	return templ.Raw(`<p>tick</p>`)
 }
+
+// gauge renders its current reading, so two renders with the same reading
+// produce identical bytes.
+type gauge struct {
+	Base
+	mu      sync.Mutex
+	reading int
+}
+
+func (g *gauge) set(v int) {
+	g.mu.Lock()
+	g.reading = v
+	g.mu.Unlock()
+}
+
+func (g *gauge) Render(context.Context) templ.Component {
+	g.mu.Lock()
+	v := g.reading
+	g.mu.Unlock()
+	return templ.ComponentFunc(func(_ context.Context, w io.Writer) error {
+		_, err := fmt.Fprintf(w, `<p>%d</p>`, v)
+		return err
+	})
+}
+
+// TestAnUnchangedRenderIsNotPushed pins the dedupe. A timer-driven
+// component re-renders every tick whether or not its state moved, and
+// before this each of those ticks was a patch: bytes down the stream, a
+// morph on the client, and any style a data-attr binding had rewritten
+// reset and re-applied - once a tick, on a page where nothing changed.
+func TestAnUnchangedRenderIsNotPushed(t *testing.T) {
+	g := &gauge{}
+	sess := newSession("test", g)
+	t.Cleanup(func() { sess.close(context.Background()) })
+	ctx := context.Background()
+
+	if _, err := sess.Render(ctx); err != nil {
+		t.Fatalf("render: %v", err)
+	}
+
+	// The first push always goes out - the paint is not recorded - and
+	// establishes what the client has.
+	if err := sess.Push(ctx); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	settle(t, sess)
+	if got := sess.take(); len(got) != 1 {
+		t.Fatalf("the first push produced %d patches, want 1", len(got))
+	}
+
+	// Nothing changed, so the tick's render is byte-identical and is
+	// dropped rather than sent.
+	if err := sess.Push(ctx); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	settle(t, sess)
+	if got := sess.take(); got != nil {
+		t.Errorf("an unchanged render was pushed: %v", got)
+	}
+
+	// The moment the state moves, the patch flows again.
+	g.set(1)
+	if err := sess.Push(ctx); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	settle(t, sess)
+	if got := sess.take(); len(got) != 1 {
+		t.Errorf("a changed render produced %d patches, want 1", len(got))
+	}
+}
