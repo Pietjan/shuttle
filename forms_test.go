@@ -273,16 +273,15 @@ func TestFormRoundTrip(t *testing.T) {
 	}
 	_, submit = c.urls(t, markup)
 
-	// Submitting it still refuses.
+	// Submitting it still refuses - and patches nothing, because the page
+	// already shows the message. Unchanged markup keeps its generation,
+	// so the endpoints it names stay valid for the retry below.
 	if code := postBody(t, srv, sid, submit, `{"c":{"email":"nope"}}`); code != http.StatusNoContent {
 		t.Fatalf("bad submit: status %d", code)
 	}
 	if c.Saved {
 		t.Error("submit committed invalid input")
 	}
-
-	markup = stream.event(t)
-	_, submit = c.urls(t, markup)
 
 	// Fixing it and submitting commits.
 	if code := postBody(t, srv, sid, submit, `{"c":{"email":"real@example.com"}}`); code != http.StatusNoContent {

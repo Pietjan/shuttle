@@ -606,11 +606,13 @@ func TestStaleClickRunsItsOwnClosure(t *testing.T) {
 	}
 	staleReset := lastPathSegment(clickURLs(t, first)[1])
 
-	// A render happens, so the client's markup is now one generation stale.
+	// A changed render ships, so the client's markup is now one generation
+	// stale. Only change mints generations: an unchanged render keeps the
+	// bytes the client holds, and with them the ids.
+	c.Count = 5
 	if _, err := sess.Render(ctx); err != nil {
 		t.Fatalf("re-render: %v", err)
 	}
-	c.Count = 5
 
 	if err := sess.Invoke(ctx, "c", staleReset); err != nil {
 		t.Fatalf("stale click rejected: %v", err)
@@ -619,10 +621,13 @@ func TestStaleClickRunsItsOwnClosure(t *testing.T) {
 		t.Errorf("stale click ran the wrong closure: count = %d, want 0", c.Count)
 	}
 
-	// Two generations on, it is genuinely gone rather than misrouted.
+	// Two shipped generations on, it is genuinely gone rather than
+	// misrouted.
+	c.Count = 7
 	if _, err := sess.Render(ctx); err != nil {
 		t.Fatalf("re-render: %v", err)
 	}
+	c.Count = 9
 	if _, err := sess.Render(ctx); err != nil {
 		t.Fatalf("re-render: %v", err)
 	}

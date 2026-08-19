@@ -27,12 +27,19 @@ type node struct {
 	cmp    Component
 
 	mu sync.Mutex
-	// gen counts this node's renders, and is part of every action id it
-	// hands out, so a click against markup a morph has replaced runs the
-	// closure it was rendered for rather than whatever now sits in that
-	// position.
+	// gen counts this node's shipped renders, and is part of every action
+	// id it hands out, so a click against markup a morph has replaced runs
+	// the closure it was rendered for rather than whatever now sits in
+	// that position. It advances only when a render produced new bytes -
+	// an unchanged render keeps the generation, which is what lets it keep
+	// the bytes.
 	gen       uint64
 	cur, prev map[string]Action
+	// last is the markup of the last adopted render, the bytes the client
+	// holds. A re-render is tried against it under the same generation
+	// first: equal bytes mean nothing changed, so nothing needs pushing
+	// and no new generation needs minting.
+	last string
 
 	// children are keyed by the caller's key; order fixes each key's path
 	// index so a child keeps its ids when its siblings come and go.
@@ -81,9 +88,63 @@ func newNode(sess *Session, parent *node, p path, key string, cmp Component) *no
 // by the same pass.
 func (n *node) render(ctx context.Context) (string, error) {
 	n.mu.Lock()
-	n.gen++
-	sc := &scope{node: n, gen: n.gen, table: map[string]Action{}, seen: map[string]bool{}}
+	gen, last := n.gen, n.last
 	n.mu.Unlock()
+
+	// First, a pass under the generation the client already holds. Equal
+	// bytes mean the state did not move: the fresh table is adopted - same
+	// ids, closures over the same state - and the cached markup goes back
+	// so the stream can recognise it and drop the patch. The generation
+	// stays put, which is what keeps the client's action ids resolving for
+	// as long as nothing changes.
+	if last != "" {
+		html, sc, err := n.renderPass(ctx, gen)
+		if err != nil {
+			return "", err
+		}
+		if html == last {
+			n.mu.Lock()
+			n.cur = sc.table
+			n.mu.Unlock()
+			n.prune(ctx, sc.seen)
+			return last, nil
+		}
+	}
+
+	// Something changed, so this render ships - under a new generation,
+	// because position n of the new markup is not necessarily the same
+	// button as position n of the old, and a click already in flight must
+	// run the closure it was rendered for. That costs a second pass, paid
+	// only on change; the table the client clicked against until now moves
+	// to prev, so a stale click still resolves however long the markup sat
+	// unchanged before this.
+	n.mu.Lock()
+	n.gen++
+	gen = n.gen
+	n.mu.Unlock()
+
+	html, sc, err := n.renderPass(ctx, gen)
+	if err != nil {
+		return "", err
+	}
+
+	n.mu.Lock()
+	n.prev, n.cur = n.cur, sc.table
+	n.last = html
+	n.mu.Unlock()
+
+	// A child the parent stopped rendering is gone: unmount it rather than
+	// leaving its state, and its action table, alive for the session.
+	n.prune(ctx, sc.seen)
+
+	return html, nil
+}
+
+// renderPass builds this component's markup once under the given
+// generation, returning it with the pass's scope. It touches none of the
+// node's tables - adopting a pass is render's decision, not the pass's.
+func (n *node) renderPass(ctx context.Context, gen uint64) (string, *scope, error) {
+	sc := &scope{node: n, gen: gen, table: map[string]Action{}, seen: map[string]bool{}}
 
 	// A fresh Loom ID counter per node, so a component rendered on its own
 	// produces the ids it had inside the page.
@@ -95,13 +156,13 @@ func (n *node) render(ctx context.Context) (string, error) {
 	if err != nil {
 		fb, ok := n.cmp.(Fallback)
 		if !ok {
-			return "", err
+			return "", nil, err
 		}
 		// The boundary: one component's failure costs that component, not
 		// the page. A fallback that also fails is not worth a second chance.
 		body, err = renderSafely(rctx, fb.RenderError(rctx, err))
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
 	}
 
@@ -109,20 +170,12 @@ func (n *node) render(ctx context.Context) (string, error) {
 	// render used - and before it in the output, which is the point.
 	var buf bytes.Buffer
 	if err := n.writeRoot(&buf, sc); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	buf.WriteString(body)
 	buf.WriteString(`</div>`)
 
-	n.mu.Lock()
-	n.prev, n.cur = n.cur, sc.table
-	n.mu.Unlock()
-
-	// A child the parent stopped rendering is gone: unmount it rather than
-	// leaving its state, and its action table, alive for the session.
-	n.prune(ctx, sc.seen)
-
-	return buf.String(), nil
+	return buf.String(), sc, nil
 }
 
 // renderBody renders the component itself, without its wrapper.
