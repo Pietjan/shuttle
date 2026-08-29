@@ -464,14 +464,23 @@ func (d *declaresOnly) Render(ctx context.Context) templ.Component {
 
 // TestSaveCleansTheClientFilename. The name comes from the client, and
 // "../../etc/passwd" is exactly what an upload endpoint gets sent.
+//
+// The exact base is asserted, not just the directory: cleaning with
+// filepath instead of path once turned "/absolute/path" into a UNC volume
+// root on Windows, whose Base is the separator - Save then opened the
+// destination directory itself. The path package is the same on every OS,
+// so pinning the names here pins them for Windows too.
 func TestSaveCleansTheClientFilename(t *testing.T) {
 	dir := t.TempDir()
 
-	for _, name := range []string{
-		"../../etc/passwd",
-		`..\..\windows\system32\evil`,
-		"/absolute/path",
-		"plain.txt",
+	for name, want := range map[string]string{
+		"../../etc/passwd":            "passwd",
+		`..\..\windows\system32\evil`: "evil",
+		"/absolute/path":              "path",
+		`C:\drive\evil`:               "evil",
+		"C:evil":                      "evil",
+		"..":                          "upload",
+		"plain.txt":                   "plain.txt",
 	} {
 		src := filepath.Join(dir, "src")
 		if err := os.WriteFile(src, []byte("x"), 0o600); err != nil {
@@ -485,6 +494,9 @@ func TestSaveCleansTheClientFilename(t *testing.T) {
 		}
 		if filepath.Dir(got) != dir {
 			t.Errorf("Save(%q) escaped to %q", name, got)
+		}
+		if base := filepath.Base(got); base != want {
+			t.Errorf("Save(%q) wrote %q, want %q", name, base, want)
 		}
 	}
 }

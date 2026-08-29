@@ -9,6 +9,7 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	slashpath "path"
 	"path/filepath"
 	"strings"
 )
@@ -151,7 +152,17 @@ func (f *UploadedFile) Open() (*os.File, error) {
 // before use: a name like "../../etc/passwd" is exactly what an upload
 // endpoint gets sent.
 func (f *UploadedFile) Save(dir string) (string, error) {
-	name := filepath.Base(filepath.Clean("/" + strings.ReplaceAll(f.Name, `\`, "/")))
+	// The path package, not filepath: this cleans the *client's* name, and
+	// the client's separators do not change with the server's OS. filepath
+	// here made "/absolute/path" into a UNC volume root on Windows, whose
+	// Base is the separator - and the "file" it then saved was dir itself.
+	name := slashpath.Base(slashpath.Clean("/" + strings.ReplaceAll(f.Name, `\`, "/")))
+	// A drive-relative Windows name ("C:evil") survives Base; the colon and
+	// everything before it goes too, or the write lands somewhere a colon
+	// means something.
+	if i := strings.LastIndexByte(name, ':'); i >= 0 {
+		name = name[i+1:]
+	}
 	if name == "." || name == "/" || name == "" {
 		name = "upload"
 	}
