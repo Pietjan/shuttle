@@ -497,13 +497,26 @@ those pages can do.
 Running replicas anyway means two things. For *availability*, it works today with session
 affinity — every request a page makes, stream included, must reach the node that holds its
 session, and a node's death is recovered by the same reload path a deploy uses, with state
-remounting from the URL. As *one logical app* — rooms and presence spanning nodes — it
-additionally needs a `Broker` backed by NATS or Redis, which is a small package the interface was
-designed for but which does not exist yet, plus a shared roster, which today is in-process even
-with a shared broker. Write components against the contract documented on `Broker` either way:
-delivery is at-most-once and messages are values, and a component that only works because the
-in-memory broker is synchronous and shares pointers is a component that breaks the day the real
-broker arrives.
+remounting from the URL. As *one logical app* — rooms spanning nodes — add the NATS broker, its
+own module so importing shuttle never pulls the NATS client:
+
+```go
+import natsbroker "github.com/pietjan/shuttle/broker/nats"
+
+nc, _ := nats.Connect(natsURL)
+handler.Broker = natsbroker.New(nc)
+natsbroker.Register(RoomMessage{})   // once per message type, on every node
+```
+
+Messages cross the wire as gob, so `HandleInfo` sees the same concrete type the publisher sent —
+that is what `Register` is for, and an unregistered type fails at `Publish` on your machine rather
+than in production. Every delivery goes through the wire, the publisher's own subscribers
+included, so one node behaves exactly like five. What the broker does not distribute is the
+presence *roster*: join and leave events cross nodes, but `Presence` lists what this node has
+seen — a shared roster is a later piece. Write components against the contract documented on
+`Broker` either way: delivery is at-most-once and messages are values, and a component that only
+works because the in-memory broker is synchronous and shares pointers is a component that breaks
+the day it runs on two nodes.
 
 ## Connection state
 

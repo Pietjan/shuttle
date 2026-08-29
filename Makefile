@@ -67,6 +67,7 @@ audit: test
 .PHONY: test
 test:
 	go test -race -buildvcs ./...
+	cd broker/nats && go test -race -buildvcs ./...
 
 ## test/e2e: run the browser end-to-end suite in the playwright container
 # The tag keeps these out of `make test`, which stays fast and needs no

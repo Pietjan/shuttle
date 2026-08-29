@@ -162,9 +162,20 @@ needs it, and building it earlier would be speculation:
   Livewire model this project rejected on day one. Multi-node means routing requests to the owning
   node - LB stickiness, or fly-replay-style forwarding off a session→node map - and failover stays
   what a deploy already is: the page reloads and remounts from its URL.
-- **A distributed Broker is a small additive package** (NATS or Redis behind the existing
-  interface). Presence across nodes becomes an optional interface the handler type-asserts on the
-  broker, so the memory broker keeps today's behaviour untouched.
+- **The distributed Broker exists now: `broker/nats`**, its own Go module so importing shuttle
+  never pulls the NATS client (the same isolation `tools/` uses; its `replace ../..` is intra-repo
+  and ignored by downstream consumers, unlike the cross-repo loom replace that was removed).
+  Messages travel as gob in an envelope, which is what hands HandleInfo the same concrete type the
+  publisher sent - applications `Register` their message types once per node, PresenceEvent is
+  registered by the package itself, and an unregistered type fails at Publish on the developer's
+  machine rather than in production. Every delivery goes through the wire, the publisher's own
+  subscribers included, so one node behaves exactly like five. Topics are base64url-encoded into
+  subjects - sanitizing would collide distinct topics. And `Subscribe` flushes: NATS buffers SUB
+  like everything else, and shuttle's `Join` subscribes-before-announcing so a joiner hears its own
+  arrival - without the round trip that promise quietly breaks, which
+  `TestUnsubscribeStopsDeliveryAndTopicsAreOpaque` found by losing a message. Tests run a real
+  embedded nats-server, no Docker. Presence across nodes remains the later piece: an optional
+  interface the handler type-asserts on the broker.
 - **The retrofit-hostile piece is the contract, not the code** - so it is written down now, on
   `Broker` and `Informer`. The in-memory broker accidentally over-promises: synchronous, ordered,
   guaranteed, and able to share live pointers between sessions. Components written against those
