@@ -4,8 +4,8 @@ go 1.26.5
 
 require (
 	github.com/a-h/templ v0.3.1020
+	github.com/mxschmitt/playwright-go v0.6201.1
 	github.com/pietjan/loom v0.0.0-20260802231856-03d8564d5bbf
-	github.com/playwright-community/playwright-go v0.6000.0
 	github.com/starfederation/datastar-go v1.2.2
 	golang.org/x/net v0.58.0
 )
@@ -17,7 +17,6 @@ require (
 	github.com/andybalholm/brotli v1.2.0 // indirect
 	github.com/deckarep/golang-set/v2 v2.8.0 // indirect
 	github.com/dlclark/regexp2/v2 v2.2.1 // indirect
-	github.com/go-jose/go-jose/v3 v3.0.5 // indirect
 	github.com/go-stack/stack v1.8.1 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect

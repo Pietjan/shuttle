@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	"github.com/a-h/templ"
-	"github.com/playwright-community/playwright-go"
+	"github.com/mxschmitt/playwright-go"
 
 	"github.com/pietjan/shuttle"
 	"github.com/pietjan/shuttle/live"

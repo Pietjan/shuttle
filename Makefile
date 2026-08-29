@@ -15,8 +15,10 @@ site_css = example/site/static/styles.css
 # and system libraries but not the npm package, which it expects from the
 # project under test - hence the npx line in test/e2e. This version has to
 # match the driver playwright-go pins (run.go: playwrightCliVersion).
-playwright_version       := 1.60.0
-playwright_download_host := https://cdn.playwright.dev/dbazure/download/playwright
+# No download-host override any more: the old driver-zip CDN answers 400
+# for every version, and playwright-go >= v0.6201 assembles its driver
+# from the playwright-core npm package instead.
+playwright_version := 1.62.1
 
 # The CLIs live in their own module so that the published library does not
 # inherit their dependency trees. -modfile runs them from that module
@@ -77,7 +79,6 @@ test/e2e: site/css
 		mcr.microsoft.com/playwright:v$(playwright_version)-noble \
 		/bin/sh -c "npx -y playwright@$(playwright_version) run-server --port 3000 --host 0.0.0.0"
 	SHUTTLE_E2E_WS=ws://127.0.0.1:3000/ \
-	PLAYWRIGHT_DOWNLOAD_HOST=$(playwright_download_host) \
 		go test -tags e2e -v -count 1 ./e2e; \
 	status=$$?; docker stop shuttle-playwright >/dev/null; exit $$status
 

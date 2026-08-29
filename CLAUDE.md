@@ -993,8 +993,15 @@ Four things about the setup, each of which cost a run to find:
   for a project that brings its own. That is why the target's `npx` line pins a version: a bare
   `npx playwright` fetches whatever is newest and greets the SDK with a protocol mismatch.
 - **That version must match what playwright-go pins** (`run.go: playwrightCliVersion`).
-- **`playwright-go@v0.6100.0` is unusable** - its `go.mod` declares the pre-rename module path - so
-  this is on `v0.6000.0`, driver 1.60.0, which is where the image tag comes from.
+- **Every playwright-go after v0.6000.0 declares the pre-rename module path**
+  (`github.com/mxschmitt/playwright-go`), so that is the path this module requires it under - the
+  GitHub redirect makes the fetch work, and requiring the community path fails to resolve. The
+  upgrade was forced, not chosen: the old driver-zip CDN answers 400 for every version (staying on
+  v0.6000.0 means the driver can never be downloaded again - only machines with a warm
+  `~/.cache/ms-playwright-go` kept working, which is how it looked fine locally while CI's cold
+  cache failed), and v0.6201+ assembles the driver from the playwright-core npm package instead.
+  Driver 1.62.1 is where the image tag comes from. toto has the same dead setup and has not
+  noticed, because its CI does not run its browser suite.
 - **The test server listens on `0.0.0.0`.** The browser is in a container and comes back through
   `host.docker.internal`; a `httptest.Server` on the loopback is invisible to it, and presents as a
   page that never loads.

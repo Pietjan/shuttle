@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/a-h/templ"
-	"github.com/playwright-community/playwright-go"
+	"github.com/mxschmitt/playwright-go"
 
 	"github.com/pietjan/loom/button"
 	"github.com/pietjan/shuttle"
