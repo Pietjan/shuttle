@@ -6,7 +6,7 @@ require (
 	github.com/a-h/templ v0.3.1020
 	github.com/nats-io/nats-server/v2 v2.14.6
 	github.com/nats-io/nats.go v1.53.1
-	github.com/pietjan/shuttle v0.0.0-20260829150427-614ac654bb34
+	github.com/pietjan/shuttle v0.0.0-20260829154800-76e29980d8f4
 )
 
 require (
