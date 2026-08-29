@@ -42,6 +42,11 @@ type Session struct {
 	// there is no request to return them to. Set by the handler.
 	onError func(what string, err error)
 
+	// stats is the handler's counter set, shared so session-side events -
+	// patches, drops, contained panics - land in Handler.Stats. A
+	// standalone session gets its own, which nothing reads.
+	stats *counters
+
 	// owner is an application-supplied label for whoever this page belongs
 	// to, so logging out can find their pages. It lives here rather than
 	// being read off the component because the component's fields belong to
@@ -116,16 +121,17 @@ type Session struct {
 // newSession builds a standalone session with its own broker and presence.
 // The registry uses newSessionWith to share the handler's instead.
 func newSession(id string, cmp Component) *Session {
-	return newSessionWith(id, cmp, NewMemoryBroker(), newPresence(), nil)
+	return newSessionWith(id, cmp, NewMemoryBroker(), newPresence(), nil, &counters{})
 }
 
-func newSessionWith(id string, cmp Component, broker Broker, pres *presence, onError func(string, error)) *Session {
+func newSessionWith(id string, cmp Component, broker Broker, pres *presence, onError func(string, error), stats *counters) *Session {
 	s := &Session{
 		id:      id,
 		tag:     newTag(),
 		broker:  broker,
 		pres:    pres,
 		onError: onError,
+		stats:   stats,
 		nodes:   map[string]*node{},
 		pending: map[string]string{},
 		sent:    map[string]string{},
@@ -318,6 +324,11 @@ func (s *Session) renderDirty() {
 // fail reports an error raised on the session's own goroutine, where there
 // is no request to return it to.
 func (s *Session) fail(what string, err error) {
+	if errors.Is(err, ErrPanic) {
+		s.stats.panics.Add(1)
+	} else if what == "render" {
+		s.stats.renderErrors.Add(1)
+	}
 	if s.onError != nil {
 		s.onError(what, err)
 	}
@@ -531,6 +542,8 @@ func (s *Session) take() []patch {
 	s.ops = nil
 	s.mu.Unlock()
 
+	s.stats.patches.Add(int64(len(out)))
+
 	// Handing a component's markup to the stream is what starts its
 	// action-id grace period - see node.markSent. The whole subtree: a
 	// parent's patch carries its children's markup too. Marked outside the
@@ -607,6 +620,7 @@ func (s *Session) enqueue(p patch) error {
 	s.mu.Unlock()
 
 	if dropped {
+		s.stats.opsDropped.Add(1)
 		// Reported outside the lock - onError is application code.
 		s.fail("stream", errOpsBacklog)
 	}
@@ -660,8 +674,11 @@ func (s *Session) attach(cancel context.CancelFunc) (*streamSlot, error) {
 	s.holder = slot
 	s.mu.Unlock()
 
-	if old != nil && old.cancel != nil {
-		old.cancel()
+	if old != nil {
+		s.stats.takeovers.Add(1)
+		if old.cancel != nil {
+			old.cancel()
+		}
 	}
 	return slot, nil
 }
@@ -768,6 +785,7 @@ func (s *Session) beginClose(ctx context.Context) {
 		return
 	}
 	s.closed = true
+	s.stats.sessionsEnded.Add(1)
 	// Appended directly rather than through submit, which refuses a closed
 	// session: this is the one item that must still run.
 	s.mailbox = append(s.mailbox, func() {

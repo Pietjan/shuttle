@@ -85,7 +85,7 @@ func newTag() string {
 }
 
 // create registers a new session for cmp and starts its attach timer.
-func (r *registry) create(cmp Component, broker Broker, pres *presence, onError func(string, error)) (*Session, error) {
+func (r *registry) create(cmp Component, broker Broker, pres *presence, onError func(string, error), stats *counters) (*Session, error) {
 	id, err := newID()
 	if err != nil {
 		return nil, err
@@ -100,7 +100,7 @@ func (r *registry) create(cmp Component, broker Broker, pres *presence, onError 
 		r.mu.Unlock()
 		return nil, ErrTooManySessions
 	}
-	s := newSessionWith(id, cmp, broker, pres, onError)
+	s := newSessionWith(id, cmp, broker, pres, onError, stats)
 	r.sessions[id] = s
 	r.mu.Unlock()
 
@@ -222,6 +222,24 @@ func (r *registry) closeAll(ctx context.Context) error {
 		// stuck in component code holds its goroutine either way.
 		return ctx.Err()
 	}
+}
+
+// gauges reports the live and attached session counts for Handler.Stats.
+// Snapshotted first, asked afterwards - see ownedBy for the two-locks rule.
+func (r *registry) gauges() (sessions, attached int) {
+	r.mu.Lock()
+	live := make([]*Session, 0, len(r.sessions))
+	for _, s := range r.sessions {
+		live = append(live, s)
+	}
+	r.mu.Unlock()
+
+	for _, s := range live {
+		if s.isAttached() {
+			attached++
+		}
+	}
+	return len(live), attached
 }
 
 // len reports the number of live sessions.

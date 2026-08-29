@@ -235,6 +235,7 @@ func (h *Handler) metered(next http.HandlerFunc) http.HandlerFunc {
 		if rate > 0 {
 			key := h.clientKey(r)
 			if !h.pages.allow(key, rate, h.pageBurst(), time.Now()) {
+				h.stats.pagesRefused.Add(1)
 				h.log().Warn("shuttle: page budget exhausted",
 					"client", key, "path", r.URL.Path)
 				w.Header().Set("Retry-After", retryAfter(rate))

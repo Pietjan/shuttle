@@ -104,7 +104,7 @@ func mountSession(t *testing.T, id string, cmp Component, broker Broker, pres *p
 	t.Helper()
 	sess := newSessionWith(id, cmp, broker, pres, func(what string, err error) {
 		t.Errorf("session error in %s: %v", what, err)
-	})
+	}, &counters{})
 	t.Cleanup(func() { sess.close(context.Background()) })
 
 	if err := sess.call(context.Background(), func() error {
@@ -455,7 +455,7 @@ func settle(t *testing.T, sess *Session) {
 func TestUnmountStopsASubscription(t *testing.T) {
 	broker := NewMemoryBroker()
 	l := &ticking{Labels: []string{"a"}, Broker: broker}
-	sess := newSessionWith("test", l, broker, newPresence(), nil)
+	sess := newSessionWith("test", l, broker, newPresence(), nil, &counters{})
 	t.Cleanup(func() { sess.close(context.Background()) })
 	ctx := context.Background()
 

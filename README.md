@@ -565,6 +565,21 @@ handler.Shutdown(ctx)  // release what the pages were holding
 Connected pages fall into the same reconnect-and-reload path a deploy already uses, so they come
 back on their own once the new process is listening.
 
+**What the handler is doing is `Handler.Stats()`** — two gauges (live sessions, attached streams)
+and cumulative counters: pages served and refused, actions and their failures, budget refusals,
+patches written, stream operations dropped, contained panics, takeovers, reloads. Shuttle picks no
+metrics system; poll it from whatever exporter the app already has and difference the counters
+into rates:
+
+```go
+expvar.Publish("shuttle", expvar.Func(func() any { return handler.Stats() }))
+```
+
+The numbers come from the places this design concentrates load where nothing else can see it: one
+goroutine runs each page, and one publish costs every subscriber a render. `Sessions` against the
+registry's cap, `OpsDropped` and `Panics` against zero, and the gap between `Sessions` and
+`Attached` are the ones worth alerting on.
+
 **Every request a page makes draws on a per-session budget** — 10/second with a burst of 40 by
 default, `RequestRate` and `RequestBurst` to change it, a negative rate to turn it off. It refills
 continuously rather than resetting, so a page open all day is in the same position as one just

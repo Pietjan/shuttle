@@ -231,6 +231,10 @@ type Handler struct {
 	once   sync.Once
 	routes *http.ServeMux
 
+	// stats is the live half of Handler.Stats. A value, so a struct-literal
+	// Handler counts too.
+	stats counters
+
 	// brokerOnce backs broker() for a Handler built as a struct literal
 	// rather than through New: every session must share one default broker,
 	// or pub/sub silently connects nobody to nobody.
@@ -412,6 +416,7 @@ func (h *Handler) budgeted(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sess, ok := h.sessionOf(r)
 		if ok && !sess.allow(h.requestRate(), h.requestBurst(), time.Now()) {
+			h.stats.budgetRefused.Add(1)
 			h.log().Warn("shuttle: request budget exhausted",
 				"session", sess.Tag(), "path", r.URL.Path)
 			// A second is the whole burst back at the default rate, and the
@@ -566,6 +571,8 @@ func (h *Handler) log() *slog.Logger {
 	return slog.Default()
 }
 
+func (h *Handler) counters() *counters { return &h.stats }
+
 func (h *Handler) broker() Broker {
 	if h.Broker != nil {
 		return h.Broker
@@ -588,8 +595,9 @@ func (h *Handler) servePage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sess, err := h.sessions.create(h.factory(), h.broker(), h.presence, h.sessionError)
+	sess, err := h.sessions.create(h.factory(), h.broker(), h.presence, h.sessionError, &h.stats)
 	if err != nil {
+		h.stats.sessionsRefused.Add(1)
 		h.fail(w, r, http.StatusServiceUnavailable, "cannot start a session", err)
 		return
 	}
@@ -665,6 +673,7 @@ func (h *Handler) servePage(w http.ResponseWriter, r *http.Request) {
 	if err := shell(w, page); err != nil {
 		h.log().Error("shuttle: writing page failed", "err", err)
 	}
+	h.stats.pagesServed.Add(1)
 }
 
 // DefaultShell writes a minimal document: the Datastar module, whatever
@@ -776,6 +785,7 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request) {
 // from the URL. That is also why Mount has to be cheap and idempotent - it
 // is what makes a rolling deploy survivable.
 func (h *Handler) tellToReload(w http.ResponseWriter, r *http.Request) {
+	h.stats.reloads.Add(1)
 	sse := datastar.NewSSE(w, r)
 	// A beat of delay, so a server that is failing every request cannot turn
 	// this into a reload loop running as fast as the network allows.
@@ -882,12 +892,14 @@ func (h *Handler) serveAction(w http.ResponseWriter, r *http.Request) {
 			// decode is a bad request, not a server fault.
 			status = http.StatusBadRequest
 		}
+		h.stats.actionsFailed.Add(1)
 		h.fail(w, r, status, "action failed", err,
 			"session", sess.Tag(), "node", r.PathValue("node"),
 			"action", r.PathValue("aid"))
 		return
 	}
 
+	h.stats.actions.Add(1)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -947,6 +959,7 @@ func (h *Handler) serveNav(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.stats.navs.Add(1)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -988,6 +1001,7 @@ func (h *Handler) serveUpload(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, ErrFileTooLarge) {
 			status = http.StatusRequestEntityTooLarge
 		}
+		h.stats.uploadsRefused.Add(1)
 		h.log().Info("shuttle: upload refused",
 			"session", sess.Tag(), "upload", name, "err", err)
 		http.Error(w, publicMessage(status, err), status)
@@ -1013,6 +1027,10 @@ func (h *Handler) serveUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.stats.uploads.Add(1)
+	for _, f := range files {
+		h.stats.uploadBytes.Add(f.Size)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

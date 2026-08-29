@@ -721,6 +721,14 @@ the session rather than the component, because component fields belong to the se
 `CloseOwner` runs on a request's. `CloseOwner("")` matches nothing, or one component forgetting to
 call `SetOwner` would make every logout global.
 
+**Observability is `Handler.Stats()` and nothing else** - a snapshot struct in `metrics.go`: two
+gauges read from the registry, cumulative counters kept as atomics in `counters`, shared with every
+session so session-side events (patches, backlog drops, contained panics, takeovers) land in it.
+No metrics dependency, deliberately: the app polls the snapshot into whatever exporter it already
+runs. `TestStatsCountTheTraffic` drives one of everything through a handler and asserts each
+counter moved - a counter nothing increments is worse than none, because a dashboard shows it flat
+and calls that health. When adding a counter, add its increment to that test.
+
 **Shutting the process down needs `Handler.Shutdown(ctx)`.** It ends every session and waits for
 their teardowns, bounded by ctx, and refuses new sessions afterwards (`ErrShutdown` → 503); a
 connected page's stream ends and its reconnect lands in `tellToReload`, the same hand-off a deploy
