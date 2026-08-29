@@ -214,7 +214,17 @@ func (s *Session) syncURL() {
 
 // path renders the page's path with the given query.
 func (s *Session) path(q url.Values) string {
-	base := s.Path()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pathLocked(q)
+}
+
+// pathLocked is path for a caller already holding mu.
+func (s *Session) pathLocked(q url.Values) string {
+	base := s.urlPath
+	if base == "" {
+		base = s.prefix + "/"
+	}
 	if len(q) == 0 {
 		return base
 	}

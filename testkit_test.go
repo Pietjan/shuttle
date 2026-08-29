@@ -511,3 +511,68 @@ func TestTheKitModelsAStreamTheWayTheBrowserDoes(t *testing.T) {
 		Text("#sent", "2").
 		Count("ul li", 2)
 }
+
+// TestSelectorFindsNestedMatches. The old walk stopped searching inside
+// anything that matched, so a .item nested in a .item was invisible -
+// Count undercounted and Missing passed over elements that were there.
+func TestSelectorFindsNestedMatches(t *testing.T) {
+	markup := `<div class="item"><div class="item"><span class="item">x</span></div></div>` +
+		`<ul id="list"><li><ul><li>deep</li></ul></li></ul>`
+
+	for sel, want := range map[string]int{
+		".item":       3,
+		"li":          2,
+		"#list li":    2,
+		".item .item": 2,
+	} {
+		got, err := selectAll(markup, sel)
+		if err != nil {
+			t.Fatalf("%s: %v", sel, err)
+		}
+		if len(got) != want {
+			t.Errorf("%s matched %d elements, want %d", sel, len(got), want)
+		}
+	}
+}
+
+// TestSelectorRefusesWhatItCannotParse. Unsupported syntax used to parse
+// into something that matched nothing, which turns Missing() and
+// Count(x, 0) into tests of the engine's limits rather than of the page.
+func TestSelectorRefusesWhatItCannotParse(t *testing.T) {
+	for _, sel := range []string{
+		"",
+		"ul > li",
+		"a, b",
+		"li:first-child",
+		"[href^=http]",
+		"[unterminated",
+		"#",
+		".",
+	} {
+		if _, err := selectAll("<p>x</p>", sel); err == nil {
+			t.Errorf("selector %q was accepted; it should be refused loudly", sel)
+		}
+	}
+}
+
+// TestSelectorCompoundsClassesAndQuotedValues.
+func TestSelectorCompoundsClassesAndQuotedValues(t *testing.T) {
+	markup := `<li class="item hot">a</li><li class="hot">b</li>` +
+		`<p title="hello world">c</p>`
+
+	got, err := selectAll(markup, "li.item.hot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Errorf("li.item.hot matched %d, want 1 - the compound must not collapse to its last class", len(got))
+	}
+
+	got, err = selectAll(markup, `[title="hello world"]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Errorf(`[title="hello world"] matched %d, want 1 - the space must not split the step`, len(got))
+	}
+}

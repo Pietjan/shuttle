@@ -43,11 +43,10 @@ func (c *counter) Render(ctx context.Context) templ.Component {
 // this is what that promise looks like from the page - the count survives,
 // so the component instance did.
 func TestReconnectKeepsTheSession(t *testing.T) {
-	// A short heartbeat, and the reason is the finding this test produced:
-	// the server only learns a client is gone when a write to it fails, and
-	// until it does, sess.attach refuses the reconnect with a 409. So the
-	// window a page spends reconnecting is bounded by Heartbeat - 25s by
-	// default, which is a long time to look broken.
+	// A short heartbeat. It used to bound the reconnect window: attach
+	// refused a held slot with a 409 until a heartbeat write failed, so a
+	// page could spend up to 25s looking broken. Attach displaces the old
+	// stream now, so the heartbeat here is only to keep the test brisk.
 	app := serveRestartable(t, func() shuttle.Component { return &counter{} })
 	p := visit(t, app.URL)
 

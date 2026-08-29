@@ -97,9 +97,7 @@ func TestMorphOverwritesWhenTheServerChangesTheValue(t *testing.T) {
 	if err := p.Locator(`[data-shuttle-role="touch"]`).Click(); err != nil {
 		t.Fatalf("touch: %v", err)
 	}
-	if err := expect(p.Locator(`[data-shuttle-renders="2"]`)).ToBeAttached(); err != nil {
-		t.Fatalf("waiting for `[data-shuttle-renders=\"2\"]`: %v", err)
-	}
+	stepped(t, p, 1)
 	if v, _ := box.InputValue(); v != "what the user typed" {
 		t.Errorf("a re-render with an unchanged value= took the typing: %q", v)
 	}
@@ -127,39 +125,48 @@ func TestActionRunsOnTheServer(t *testing.T) {
 	eventually(t, "the action to have run", func() bool { return cmp.Ticks > 0 })
 }
 
-// server renders whatever value it was last told to, and counts its own
-// renders so a test can wait for one.
+// server renders whatever value it was last told to, and counts the actions
+// it has handled so a test can wait for one's re-render to land.
+//
+// Actions, not render passes: a render pass is not a unit the client can
+// see. Since generations are minted on change, every shipped re-render is
+// two passes (the trial against the client's bytes, then the one that
+// ships), so a pass counter in the markup runs 1, 3, 5 - and a test waiting
+// for pass 2 waits forever. The step changes exactly once per click, which
+// also guarantees each click's patch differs and actually ships.
 type server struct {
 	shuttle.Base
-	Value   string
-	Renders int
+	Value string
+	Step  int
 }
 
 func (c *server) Render(ctx context.Context) templ.Component {
-	c.Renders++
-
 	box := input.New(
 		shuttle.ID(ctx, input.ID, "field"),
 		input.Value(c.Value),
 	)
 	touch := button.New(
 		button.Attr("data-shuttle-role", "touch"),
-		shuttle.OnClick(ctx, button.Attr, func(context.Context) error { return nil }),
+		shuttle.OnClick(ctx, button.Attr, func(context.Context) error {
+			c.Step++
+			return nil
+		}),
 	)
 	change := button.New(
 		button.Attr("data-shuttle-role", "change"),
 		shuttle.OnClick(ctx, button.Attr, func(context.Context) error {
+			c.Step++
 			c.Value = "second"
 			return nil
 		}),
 	)
 
-	renders := c.Renders
+	step := c.Step
 	return seq(box,
 		with(touch, text("touch")),
 		with(change, text("change")),
 		templ.ComponentFunc(func(_ context.Context, w io.Writer) error {
-			_, err := fmt.Fprintf(w, `<p data-shuttle-renders="%d"></p>`, renders)
+			_, err := fmt.Fprintf(w, `<p data-shuttle-step="%d"></p>`, step)
 			return err
 		}),
 	)
@@ -188,45 +195,47 @@ func (c *server) Render(ctx context.Context) templ.Component {
 // leaves the typing be; change it and the server wins.
 type writing struct {
 	shuttle.Base
-	Value   string
-	Renders int
+	Value string
+	Step  int
 }
 
 func (c *writing) Render(ctx context.Context) templ.Component {
-	c.Renders++
-
 	box := textarea.New(
 		shuttle.ID(ctx, textarea.ID, "notes"),
 		textarea.Value(c.Value),
 	)
 	touch := button.New(
 		button.Attr("data-shuttle-role", "touch"),
-		shuttle.OnClick(ctx, button.Attr, func(context.Context) error { return nil }),
+		shuttle.OnClick(ctx, button.Attr, func(context.Context) error {
+			c.Step++
+			return nil
+		}),
 	)
 	change := button.New(
 		button.Attr("data-shuttle-role", "change"),
 		shuttle.OnClick(ctx, button.Attr, func(context.Context) error {
+			c.Step++
 			c.Value = "second"
 			return nil
 		}),
 	)
 
-	renders := c.Renders
+	step := c.Step
 	return seq(box,
 		with(touch, text("touch")),
 		with(change, text("change")),
 		templ.ComponentFunc(func(_ context.Context, w io.Writer) error {
-			_, err := fmt.Fprintf(w, `<p data-shuttle-renders="%d"></p>`, renders)
+			_, err := fmt.Fprintf(w, `<p data-shuttle-step="%d"></p>`, step)
 			return err
 		}),
 	)
 }
 
-// rendered waits for the component to have rendered n times, so a test can
-// say "after the re-render" without sleeping through one.
-func rendered(t *testing.T, p playwright.Page, n int) {
+// stepped waits for the re-render caused by the nth click to land - see the
+// step counter's comment on server for why passes cannot be counted.
+func stepped(t *testing.T, p playwright.Page, n int) {
 	t.Helper()
-	sel := fmt.Sprintf(`[data-shuttle-renders="%d"]`, n)
+	sel := fmt.Sprintf(`[data-shuttle-step="%d"]`, n)
 	if err := expect(p.Locator(sel)).ToBeAttached(); err != nil {
 		t.Fatalf("waiting for %s: %v", sel, err)
 	}
@@ -247,7 +256,7 @@ func TestMorphKeepsWhatWasTypedInATextarea(t *testing.T) {
 	if err := p.Locator(`[data-shuttle-role="touch"]`).Click(); err != nil {
 		t.Fatalf("touch: %v", err)
 	}
-	rendered(t, p, 2)
+	stepped(t, p, 1)
 
 	if err := expect(box).ToHaveValue("half a sentence"); err != nil {
 		t.Errorf("a re-render took the typing out of the textarea: %v", err)
@@ -275,7 +284,7 @@ func TestMorphOverwritesTheTextareaWhenTheServerChangesIt(t *testing.T) {
 	if err := p.Locator(`[data-shuttle-role="touch"]`).Click(); err != nil {
 		t.Fatalf("touch: %v", err)
 	}
-	rendered(t, p, 2)
+	stepped(t, p, 1)
 	if v, _ := box.InputValue(); v != "what the user typed" {
 		t.Errorf("an unchanged re-render took the typing: %q", v)
 	}
@@ -296,7 +305,7 @@ func TestMorphOverwritesTheTextareaWhenTheServerChangesIt(t *testing.T) {
 	if err := p.Locator(`[data-shuttle-role="touch"]`).Click(); err != nil {
 		t.Fatalf("touch: %v", err)
 	}
-	rendered(t, p, 4)
+	stepped(t, p, 3)
 	if err := expect(box).ToHaveValue("typed after the change"); err != nil {
 		t.Errorf("the textarea kept being overwritten, so defaultValue never caught up: %v", err)
 	}

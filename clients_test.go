@@ -190,6 +190,13 @@ func TestForwardedClientIPIgnoresAForgedPrefix(t *testing.T) {
 			want:    "10.0.0.1",
 			because: "nothing to read",
 		},
+		"hops too high reads client-written garbage": {
+			hops:    3,
+			header:  []string{"not-an-address, 203.0.113.7, 10.0.0.2"},
+			remote:  "10.0.0.1:5000",
+			want:    "10.0.0.1",
+			because: "a position past the trusted suffix is client text, and arbitrary strings must not become bucket keys",
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			r := httptest.NewRequest(http.MethodGet, "/", nil)

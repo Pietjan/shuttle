@@ -335,7 +335,7 @@ func TestUnmountedComponentStreamsNothing(t *testing.T) {
 	// page can take.
 	show := func(round int, what string) {
 		t.Helper()
-		if err := sess.call(func() error {
+		if err := sess.call(ctx, func() error {
 			p.Shown = what
 			_, err := sess.Render(ctx)
 			return err

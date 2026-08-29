@@ -42,7 +42,20 @@ func Signal(ctx context.Context, name string) string {
 	if !ok {
 		return ""
 	}
+	mustBeSignalName(name)
 	return sc.path().namespace() + "." + name
+}
+
+// mustBeSignalName panics on a name Datastar would quietly mangle. A panic
+// rather than a silent wrong path: it happens during a render, where the
+// panic guard turns it into a render error naming the mistake - the
+// alternative was a binding that watched a signal that never fires.
+func mustBeSignalName(name string) {
+	if !signalNameRE.MatchString(name) {
+		panic(fmt.Sprintf(
+			"shuttle: signal name %q must be a plain identifier: Datastar reads dots as path separators and camel-cases hyphens",
+			name))
+	}
 }
 
 // Ref returns a signal as an expression reference - "$c.query" - which is
@@ -70,7 +83,43 @@ func Bind[O ~func(T), T any](ctx context.Context, attr Attrs[O], name string) O 
 	if !ok {
 		return func(T) {}
 	}
+	mustBeSignalName(name)
 	return bind(attr, pair{"data-bind", sc.path().namespace() + "." + name})
+}
+
+// PatchSignal pushes a new value into one of this component's client-side
+// signals, down the page's stream.
+//
+// It exists for the one gap __ifmissing leaves. Declared signals are
+// deliberately never overwritten by a re-render - that is what keeps a
+// morph from resetting what the user is typing - but it also means server
+// state and client signal can drift apart when the server side genuinely
+// moves: a back button restoring a filter through HandleParams, a combobox
+// writing its choice into the field. This is the explicit, targeted write
+// for those moments; renders stay unable to clobber the client by accident.
+//
+// Like Push, it may be called from any goroutine; the patch is queued for
+// the stream.
+func (b *Base) PatchSignal(name string, value any) error {
+	if b.n == nil {
+		return ErrNotMounted
+	}
+	if !signalNameRE.MatchString(name) {
+		return fmt.Errorf(
+			"%w: signal name %q must be a plain identifier: Datastar reads dots as path separators and camel-cases hyphens",
+			ErrBadComponent, name)
+	}
+
+	// The component's namespace, built as nesting: {"c":{"1":{name: value}}}.
+	inner := map[string]any{name: value}
+	for i := len(b.n.path) - 1; i >= 0; i-- {
+		inner = map[string]any{strconv.Itoa(b.n.path[i]): inner}
+	}
+	payload, err := json.Marshal(map[string]any{signalRoot: inner})
+	if err != nil {
+		return fmt.Errorf("shuttle: signal %q: %w", name, err)
+	}
+	return b.n.sess.enqueue(patch{signals: string(payload)})
 }
 
 // signalAttrs renders a component's declared signals as attributes for its

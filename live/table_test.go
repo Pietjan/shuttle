@@ -3,6 +3,7 @@ package live_test
 import (
 	"context"
 	"errors"
+	"net/url"
 	"sort"
 	"strings"
 	"testing"
@@ -62,11 +63,11 @@ func newTable() *live.Table[user] {
 		Columns: []live.Column[user]{
 			{
 				Key: "name", Title: "Name", Sortable: true,
-				Cell: func(u user) templ.Component { return live.Text(u.Name) },
+				Cell: func(_ context.Context, u user) templ.Component { return live.Text(u.Name) },
 			},
 			{
 				Key: "team", Title: "Team", Sortable: true,
-				Cell: func(u user) templ.Component { return live.Text(u.Team) },
+				Cell: func(_ context.Context, u user) templ.Component { return live.Text(u.Team) },
 			},
 		},
 		Load:       loadUsers,
@@ -383,4 +384,94 @@ func TestTableSortCyclesBackToUnsorted(t *testing.T) {
 	if q := tbl.Query(); q.Sort != "team" || q.Desc {
 		t.Errorf("switching column gave sort=%q desc=%v, want team ascending", q.Sort, q.Desc)
 	}
+}
+
+// TestAPagePastTheEndSnapsBack. ?page=99 arrives in shared links and in
+// URLs whose set shrank since they were copied; without the snap the pager
+// renders "491-490 of 15" around an empty body.
+func TestAPagePastTheEndSnapsBack(t *testing.T) {
+	tbl := newTable()
+	l := shuttle.Test(t, tbl).Params("page=99")
+
+	if got := tbl.Query().Offset; got != 4 {
+		t.Errorf("offset = %d, want the last page's 4", got)
+	}
+	if names := rowNames(t, l); len(names) == 0 {
+		t.Error("the snapped-to page rendered no rows")
+	}
+	if strings.Contains(l.HTML(), "of 15</") && strings.Contains(l.HTML(), "197") {
+		t.Errorf("count line still describes the impossible page")
+	}
+}
+
+// TestHidingTheSortedColumnUnsorts. The third click on a heading is the
+// only way back to the source's own order, and hiding that column takes
+// the control off the screen - so hiding it is the un-sort, rather than
+// data staying ordered by a key nobody can see or reach.
+func TestHidingTheSortedColumnUnsorts(t *testing.T) {
+	tbl := newTable()
+	l := shuttle.Test(t, tbl).Params("sort=team")
+
+	if tbl.Query().Sort != "team" {
+		t.Fatal("the sort did not arrive from the URL")
+	}
+	l.Click(`[data-shuttle-column="team"]`)
+
+	if got := tbl.Query().Sort; got != "" {
+		t.Errorf("sort = %q after hiding its column, want unsorted", got)
+	}
+	if _, ok := tbl.QueryParams()["sort"]; ok {
+		t.Error("the URL still carries a sort nobody can cycle off")
+	}
+}
+
+// TestHidingEverythingRepairsTheState. Visible falls back to the first
+// column, and the rest of the component has to follow: a picker rendering
+// that column unticked, and a URL still hiding it, would both describe a
+// table that is not on the screen.
+func TestHidingEverythingRepairsTheState(t *testing.T) {
+	tbl := newTable()
+	l := shuttle.Test(t, tbl).Params("hide=name,team")
+
+	if got := len(tbl.Visible()); got != 1 {
+		t.Fatalf("%d visible columns, want the fallback of 1", got)
+	}
+	shown := tbl.Visible()[0].Key
+	if hidden := tbl.QueryParams().Get("hide"); strings.Contains(hidden, shown) {
+		t.Errorf("hide=%q still names the column on screen", hidden)
+	}
+	if !strings.Contains(l.HTML(), `data-shuttle-column="`+shown+`" aria-pressed="true"`) {
+		t.Error("the picker does not tick the column that is showing")
+	}
+}
+
+// TestTwoTablesShareAURLThroughParam. The URL keys are literals, so two
+// tables on one page would fight over q, sort and page - Param is the
+// namespace that keeps them apart, and both views survive a round trip
+// through one query string.
+func TestTwoTablesShareAURLThroughParam(t *testing.T) {
+	a, b := newTable(), newTable()
+	a.Param, b.Param = "a", "b"
+
+	if err := a.HandleParams(context.Background(), paramsOf("a-q=core&b-q=infra")); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.HandleParams(context.Background(), paramsOf("a-q=core&b-q=infra")); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := a.Query().Filter; got != "core" {
+		t.Errorf("table a filter = %q, want its own key's value", got)
+	}
+	if got := b.Query().Filter; got != "infra" {
+		t.Errorf("table b filter = %q, want its own key's value", got)
+	}
+	if got := a.QueryParams().Get("a-q"); got != "core" {
+		t.Errorf("table a writes a-q=%q, want core", got)
+	}
+}
+
+func paramsOf(qs string) shuttle.Params {
+	v, _ := url.ParseQuery(qs)
+	return shuttle.Params(v)
 }

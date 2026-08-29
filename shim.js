@@ -43,11 +43,16 @@ function shuttleShim({ nav, up, sid, header }) {
   document.addEventListener('datastar-fetch', (e) => {
     const d = e.detail || {};
 
-    if (d.type === 'started' || String(d.type).startsWith('datastar-patch-')) {
+    if (String(d.type).startsWith('datastar-patch-')) {
       // A patch can only have come down the stream, so it is proof the
-      // stream is alive. 'started' is here too, so a freshly loaded page
-      // does not sit on 'connecting' until the first heartbeat.
+      // stream is alive - whatever request delivered it.
       set('connected');
+    } else if (d.type === 'started') {
+      // 'started' is only the request going out, so it proves nothing
+      // about the stream unless it IS the stream: an action's fetch
+      // starting must not paint a dead page 'connected' while the probe
+      // below is still the only way back.
+      if (fromStream(d.el)) set('connected');
     } else if (d.type === 'error' || d.type === 'retrying') {
       if (fromStream(d.el)) set('reconnecting');
     } else if (d.type === 'retries-failed' && fromStream(d.el)) {
@@ -73,15 +78,29 @@ function shuttleShim({ nav, up, sid, header }) {
   // answer changes. showPopover throws if the panel is already open, which
   // is the common case as someone types, so both calls are guarded by the
   // state we are moving away from.
+  //
+  // The value is applied only when it CHANGES, and that is the whole
+  // light-dismiss story. Escape and an outside click close the panel in
+  // the browser alone - the server still believes it is open, so any later
+  // patch to the component (a parent's push, a reconnect) re-renders the
+  // same open state, and re-applying it would pop a panel the user just
+  // dismissed back open. The server bumps the value on every new search,
+  // so typing reopens; everything else leaves the user's dismissal alone.
+  const synced = new WeakMap();
   const syncPanels = () => {
-    for (const root of document.querySelectorAll('[data-shuttle-open]')) {
-      const panel = root.querySelector(':scope [popover]');
+    for (const owner of document.querySelectorAll('[data-shuttle-open]')) {
+      const panel = owner.querySelector(':scope [popover]');
       if (!panel) continue;
-      const want = root.getAttribute('data-shuttle-open') === 'true';
+      const value = owner.getAttribute('data-shuttle-open');
+      if (synced.get(panel) === value) continue;
+      const want = value !== 'false' && value !== '';
       const open = panel.matches(':popover-open');
       try {
         if (want && !open) panel.showPopover();
         else if (!want && open) panel.hidePopover();
+        // Recorded only once applied, or a panel that was not yet in the
+        // document would remember a state it never reached.
+        synced.set(panel, value);
       } catch (_) { /* not connected yet; the next patch will do it */ }
     }
   };
@@ -107,6 +126,14 @@ function shuttleShim({ nav, up, sid, header }) {
     const container = e.target && e.target.closest && e.target.closest('[data-shuttle-roving]');
     if (!container) return;
 
+    // Anything that uses arrow keys for its own editing keeps them. The
+    // rove field is the one exception: ArrowDown out of it into the list
+    // is the whole pattern.
+    if (e.target instanceof Element &&
+        e.target.matches('textarea, select, [contenteditable], input:not([data-shuttle-rove-field])')) {
+      return;
+    }
+
     const field = container.querySelector('[data-shuttle-rove-field]');
     if (e.key === 'Escape') {
       // preventDefault below also cancels the popover's own Esc handling,
@@ -119,7 +146,9 @@ function shuttleShim({ nav, up, sid, header }) {
 
     const rows = Array.prototype.filter.call(
       container.querySelectorAll('[data-shuttle-rove-item]'),
-      (el) => el.offsetParent !== null && !el.disabled,
+      // checkVisibility where it exists: offsetParent is null for any
+      // position:fixed element, visible or not.
+      (el) => (el.checkVisibility ? el.checkVisibility() : el.offsetParent !== null) && !el.disabled,
     );
     if (rows.length === 0) return;
     e.preventDefault();
@@ -140,6 +169,11 @@ function shuttleShim({ nav, up, sid, header }) {
 
   // Uploads. XMLHttpRequest rather than fetch, because fetch reports no
   // upload progress at all - that is the whole reason this exists.
+  //
+  // One transfer per input: picking again while one is in flight aborts
+  // it, or two requests would fight over the same progress attributes and
+  // whichever finished first would clear the state of the one still going.
+  const uploading = new WeakMap();
   document.addEventListener('change', (e) => {
     const el = e.target;
     if (!(el instanceof HTMLInputElement)) return;
@@ -149,7 +183,17 @@ function shuttleShim({ nav, up, sid, header }) {
     const body = new FormData();
     for (const file of el.files) body.append('files', file, file.name);
 
+    const prev = uploading.get(el);
+    if (prev) prev.abort();
+
+    const xhr = new XMLHttpRequest();
+    uploading.set(el, xhr);
+
     const done = (state, detail) => {
+      // An aborted transfer's callbacks fire after its replacement has
+      // started; only the current transfer may touch the input's state.
+      if (uploading.get(el) !== xhr) return;
+      uploading.delete(el);
       el.removeAttribute('data-shuttle-uploading');
       el.removeAttribute('data-shuttle-progress');
       el.style.removeProperty('--shuttle-progress');
@@ -157,11 +201,13 @@ function shuttleShim({ nav, up, sid, header }) {
         el.setAttribute('data-shuttle-upload-error', detail || 'upload failed');
       } else {
         el.removeAttribute('data-shuttle-upload-error');
-        el.value = '';
       }
+      // Cleared on failure too: change only fires when the selection
+      // changes, so a value left in place would make retrying the same
+      // file - the most likely thing to do after a failure - a no-op.
+      el.value = '';
     };
 
-    const xhr = new XMLHttpRequest();
     xhr.open('POST', endpoint, true);
     // After open, which is the only point a header can be set.
     xhr.setRequestHeader(header, sid);
@@ -169,7 +215,7 @@ function shuttleShim({ nav, up, sid, header }) {
     el.removeAttribute('data-shuttle-upload-error');
 
     xhr.upload.addEventListener('progress', (p) => {
-      if (!p.lengthComputable) return;
+      if (!p.lengthComputable || uploading.get(el) !== xhr) return;
       const pct = Math.round((p.loaded / p.total) * 100);
       // The attribute is for selectors, the custom property for widths, so
       // a progress bar costs no round trips.
@@ -184,12 +230,19 @@ function shuttleShim({ nav, up, sid, header }) {
     xhr.send(body);
   });
 
-  window.addEventListener('popstate', () => {
-    fetch(nav, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', [header]: sid },
-      body: JSON.stringify({ url: location.pathname + location.search }),
-      keepalive: true,
-    });
+  window.addEventListener('popstate', async () => {
+    try {
+      const r = await fetch(nav, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', [header]: sid },
+        body: JSON.stringify({ url: location.pathname + location.search }),
+        keepalive: true,
+      });
+      // A refusal means the server cannot follow: the session is gone, or
+      // history points somewhere this handler never wrote. The address bar
+      // has already moved, so the only way the page and the URL agree
+      // again is to load what the URL actually names.
+      if (!r.ok) location.reload();
+    } catch (_) { /* transport failures belong to the connection watcher */ }
   });
 }

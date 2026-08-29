@@ -69,10 +69,12 @@ func (l *Live) mount(p Params) {
 	l.tb.Helper()
 
 	ctx := context.Background()
+	l.sess.mu.Lock()
 	l.sess.params = p
-	l.sess.url = l.sess.path(nil)
+	l.sess.url = l.sess.pathLocked(nil)
+	l.sess.mu.Unlock()
 
-	err := l.sess.call(func() error {
+	err := l.sess.call(ctx, func() error {
 		if m, ok := l.sess.root.cmp.(Mounter); ok {
 			if err := m.Mount(ctx, p); err != nil {
 				return fmt.Errorf("mount: %w", err)
@@ -90,6 +92,9 @@ func (l *Live) mount(p Params) {
 	if err != nil {
 		l.tb.Fatalf("shuttle: mounting: %v", err)
 	}
+	// The kit is now holding this markup the way a browser holds its first
+	// paint, so the generations in it get the same in-flight-click grace.
+	l.sess.markTreeSent()
 }
 
 // Component returns the instance under test, for asserting on its state
@@ -104,6 +109,15 @@ func (l *Live) HTML() string { return l.markup }
 
 // Signal sets a client-side signal value carried by the next action, as
 // though the user had typed it into a bound input.
+//
+// The name is local: it lands in the namespace of whichever component the
+// action fires on, exactly as DecodeSignals will read it. That mirrors the
+// browser, where filterSignals scopes each action's payload to its own
+// component - so a value set here never leaks into a different component's
+// action the way a global store would let it.
+//
+// Values are sticky, like the browser's signal store they stand in for: a
+// value set once rides on every later action until it is set again.
 func (l *Live) Signal(name string, value any) *Live {
 	l.signals[name] = value
 	return l
@@ -272,7 +286,7 @@ func (l *Live) signalContext() context.Context {
 func (l *Live) run(what string, fn func() error) {
 	l.tb.Helper()
 
-	if err := l.sess.call(fn); err != nil {
+	if err := l.sess.call(context.Background(), fn); err != nil {
 		l.tb.Fatalf("shuttle: %s: %v", what, err)
 		return
 	}
@@ -284,13 +298,21 @@ func (l *Live) run(what string, fn func() error) {
 func (l *Live) settle() {
 	// The mailbox is first-in-first-out, so when an empty item comes back
 	// the work queued before it has run - and its renders with it.
-	_ = l.sess.call(func() error { return nil })
+	if err := l.sess.call(context.Background(), func() error { return nil }); err != nil {
+		// A closed session cannot settle; saying so beats asserting on
+		// whatever markup happened to be lying around.
+		l.tb.Errorf("shuttle: settling: %v", err)
+		return
+	}
 
 	for _, p := range l.sess.take() {
 		switch {
 		case p.script != "":
 			// Nothing to apply: navigation travels down the stream as a
 			// script rather than as markup.
+		case p.signals != "":
+			// A server-side signal write; the kit's flat signal map does not
+			// model the namespaced store, so it is recorded but not applied.
 		default:
 			// Every patch lands where the browser would put it: a child
 			// splicing in its own re-render, or a stream operation adding,
@@ -307,6 +329,11 @@ func (l *Live) settle() {
 				l.markup = merged
 			} else if p.target == l.sess.RootID() && p.mode == datastar.ElementPatchModeOuter {
 				l.markup = p.html
+			} else {
+				// A browser drops a patch whose target is missing with only a
+				// console warning; a test should be louder, because every
+				// assertion after this one would run against stale markup.
+				l.tb.Errorf("shuttle: patch target %q is not in the page", p.target)
 			}
 		}
 		l.patches = append(l.patches, p)

@@ -1,12 +1,14 @@
 package shuttle
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -228,6 +230,12 @@ type Handler struct {
 	// routes is built on the first request, so Prefix can be set after New.
 	once   sync.Once
 	routes *http.ServeMux
+
+	// brokerOnce backs broker() for a Handler built as a struct literal
+	// rather than through New: every session must share one default broker,
+	// or pub/sub silently connects nobody to nobody.
+	brokerOnce    sync.Once
+	defaultBroker Broker
 }
 
 // Shell renders the document a browser first loads, around the component's
@@ -546,12 +554,24 @@ func (h *Handler) broker() Broker {
 	if h.Broker != nil {
 		return h.Broker
 	}
-	return NewMemoryBroker()
+	// One shared default, not one per call: handing every session its own
+	// broker would make Publish a message to nobody, silently.
+	h.brokerOnce.Do(func() { h.defaultBroker = NewMemoryBroker() })
+	return h.defaultBroker
 }
 
 // servePage is the first phase: a complete document, rendered on the
 // server, that works before any script runs.
 func (h *Handler) servePage(w http.ResponseWriter, r *http.Request) {
+	// ServeMux routes HEAD through GET patterns. A HEAD deserves the same
+	// headers a GET would get, not a session - each one costs a component
+	// tree, and the requester has already said it will discard the body.
+	if r.Method == http.MethodHead {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		return
+	}
+
 	sess, err := h.sessions.create(h.factory(), h.broker(), h.presence, h.sessionError)
 	if err != nil {
 		h.fail(w, r, http.StatusServiceUnavailable, "cannot start a session", err)
@@ -559,6 +579,9 @@ func (h *Handler) servePage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	// Locked: the session's goroutine is already running, and these fields
+	// are read from it.
+	sess.mu.Lock()
 	sess.params = Params(r.URL.Query())
 	sess.prefix = strings.TrimSuffix(h.Prefix, "/")
 
@@ -566,14 +589,15 @@ func (h *Handler) servePage(w http.ResponseWriter, r *http.Request) {
 	// component syncing its URL state should not move a browser that is
 	// already where it belongs.
 	sess.urlPath = r.URL.Path
-	sess.url = sess.path(r.URL.Query())
+	sess.url = sess.pathLocked(r.URL.Query())
+	sess.mu.Unlock()
 
 	// Mount, HandleParams and the first render run on the session's own
 	// goroutine, like every other piece of component work - Mount may
 	// subscribe to a topic, and a message could arrive before the render
 	// finishes.
 	var body string
-	err = sess.call(func() error {
+	err = sess.call(ctx, func() error {
 		if m, ok := sess.Component().(Mounter); ok {
 			if err := m.Mount(ctx, sess.Params()); err != nil {
 				return fmt.Errorf("mount: %w", err)
@@ -596,6 +620,12 @@ func (h *Handler) servePage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "cannot render", http.StatusInternalServerError)
 		return
 	}
+
+	// The document about to be written is markup the client will hold, so
+	// every generation it carries earns the in-flight-click grace that
+	// streamed patches get - without this, the first re-render would retire
+	// first-paint action ids with no grace at all.
+	sess.markTreeSent()
 
 	h.checkIDs(sess, body)
 
@@ -685,20 +715,38 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := sess.attach(); err != nil {
+	// HEAD matches the GET pattern in ServeMux, and a HEAD response's
+	// writes are silently discarded - so a HEAD here would claim the stream
+	// slot with a connection that can never carry a patch. Answer with the
+	// headers and nothing else.
+	if r.Method == http.MethodHead {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-store")
+		return
+	}
+
+	// The newest stream wins the slot; whoever held it is cancelled. See
+	// Session.attach for why displacing beats refusing.
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	slot, err := sess.attach(cancel)
+	if err != nil {
 		http.Error(w, publicMessage(http.StatusConflict, err), http.StatusConflict)
 		return
 	}
 	h.sessions.hold(sess.ID())
 
 	defer func() {
-		sess.detach()
-		// Outlive the disconnect: Datastar reconnects on its own, and the
-		// component's state should still be here when it does.
-		h.sessions.expireIn(sess.ID(), h.grace())
+		// A stream displaced by a takeover no longer owns the slot, and must
+		// not start the eviction clock on a session that is still attached.
+		if sess.detach(slot) {
+			// Outlive the disconnect: Datastar reconnects on its own, and the
+			// component's state should still be here when it does.
+			h.sessions.expireIn(sess.ID(), h.grace())
+		}
 	}()
 
-	sse := datastar.NewSSE(w, r)
+	sse := datastar.NewSSE(w, r.WithContext(ctx))
 	if err := sess.stream(sse, h.heartbeat()); err != nil {
 		h.log().Debug("shuttle: stream ended", "session", sess.Tag(), "err", err)
 	}
@@ -783,11 +831,25 @@ func (h *Handler) serveAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The body is read here, on the request's goroutine, not the session's.
+	// One goroutine runs every component on the page, so a client trickling
+	// its POST body would otherwise hold that goroutine - and, through a
+	// synchronous broker delivery, could back up other sessions too - for
+	// as long as it cares to keep the socket open.
+	values, err := readSignals(r, n.path)
+	if err != nil {
+		h.fail(w, r, http.StatusBadRequest, "action failed",
+			fmt.Errorf("%w: %w", errBadSignals, err),
+			"session", sess.Tag(), "node", r.PathValue("node"),
+			"action", r.PathValue("aid"))
+		return
+	}
+
 	// The action runs on the session's goroutine, so it cannot be inside the
 	// component at the same time as a pub/sub message or a timer tick. The
 	// re-render is marked in the same work item and happens right after it.
-	err := sess.call(func() error {
-		if err := h.invoke(n, r); err != nil {
+	err = sess.call(r.Context(), func() error {
+		if err := h.invoke(n, r, values); err != nil {
 			return err
 		}
 		// Only the component that handled the event re-renders. An event on
@@ -813,6 +875,14 @@ func (h *Handler) serveAction(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// ownsPath reports whether a path lives at or under this handler's mount
+// point - the only places server-initiated navigation can have written into
+// the history this handler replays.
+func (h *Handler) ownsPath(p string) bool {
+	base := strings.TrimSuffix(h.Prefix, "/")
+	return p == base || p == base+"/" || strings.HasPrefix(p, base+"/")
+}
+
 // serveNav handles the back and forward buttons: the only part of
 // navigation the server cannot see for itself. The page reports where
 // history moved to, and the re-render comes back down the stream.
@@ -836,6 +906,16 @@ func (h *Handler) serveNav(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad url", http.StatusBadRequest)
 		return
 	}
+	// The URL is client input, and Session.Path is what a Subtree component
+	// routes on - so an unchecked value here would let a page move its
+	// session anywhere on the server without that path ever passing the
+	// middleware mounted in front of it. Navigation the server did not
+	// initiate is only ever the back button walking history this handler
+	// wrote, and everything it wrote lives under the mount point.
+	if u.Scheme != "" || u.Host != "" || !h.ownsPath(u.Path) {
+		http.Error(w, "url outside this handler", http.StatusBadRequest)
+		return
+	}
 
 	// The browser has already moved; record where, so the next render does
 	// not try to move it back.
@@ -843,7 +923,7 @@ func (h *Handler) serveNav(w http.ResponseWriter, r *http.Request) {
 	sess.url = u.String()
 	sess.mu.Unlock()
 
-	if err := sess.call(func() error {
+	if err := sess.call(r.Context(), func() error {
 		return sess.applyLocation(r.Context(), u)
 	}); err != nil {
 		h.fail(w, r, http.StatusInternalServerError, "navigation failed", err,
@@ -901,7 +981,11 @@ func (h *Handler) serveUpload(w http.ResponseWriter, r *http.Request) {
 	// job to copy out.
 	defer discard(files)
 
-	err = sess.call(func() error {
+	// WithoutCancel: the deferred discard deletes the temp files when this
+	// function returns, so bailing out on a dropped connection would pull
+	// them out from under a HandleUpload still reading them on the
+	// session's goroutine. This wait is bounded by the handler itself.
+	err = sess.call(context.WithoutCancel(r.Context()), func() error {
 		if err := n.cmp.(UploadHandler).HandleUpload(r.Context(), name, files); err != nil {
 			return err
 		}
@@ -919,8 +1003,14 @@ func (h *Handler) serveUpload(w http.ResponseWriter, r *http.Request) {
 // receiveAll streams the request's parts to temp files.
 func (h *Handler) receiveAll(w http.ResponseWriter, r *http.Request, spec Upload) ([]*UploadedFile, error) {
 	// A hard ceiling on the request as a whole, so a client cannot send one
-	// enormous body made of many small parts.
+	// enormous body made of many small parts. Guarded against overflow:
+	// size times count is client-facing configuration multiplied together,
+	// and a wrapped-negative limit here would make MaxBytesReader refuse
+	// every upload while looking exactly like a client fault.
 	limit := spec.maxSize()*int64(spec.maxFiles()) + (1 << 20)
+	if limit <= 0 || limit/int64(spec.maxFiles()) < spec.maxSize() {
+		limit = math.MaxInt64
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, limit)
 
 	parts, err := r.MultipartReader()
@@ -929,6 +1019,11 @@ func (h *Handler) receiveAll(w http.ResponseWriter, r *http.Request, spec Upload
 	}
 
 	var files []*UploadedFile
+	// Filenameless parts are skipped, not received - but each one still
+	// costs a read, so their number needs a ceiling of its own or a body of
+	// nothing but empty parts is a way to spend one budget token on
+	// hundreds of thousands of iterations.
+	skipped := 0
 	for {
 		part, err := parts.NextPart()
 		if errors.Is(err, io.EOF) {
@@ -939,6 +1034,9 @@ func (h *Handler) receiveAll(w http.ResponseWriter, r *http.Request, spec Upload
 		}
 		if part.FileName() == "" {
 			_ = part.Close()
+			if skipped++; skipped > 64 {
+				return files, fmt.Errorf("shuttle: reading upload: %w", ErrTooManyFiles)
+			}
 			continue
 		}
 
@@ -976,7 +1074,7 @@ func (h *Handler) sessionError(what string, err error) {
 // invoke runs the action, turning a panicking handler into an error. One
 // bad action should cost the client a failed click, not the whole session:
 // the component tree is still here and the stream is still open.
-func (h *Handler) invoke(n *node, r *http.Request) (err error) {
+func (h *Handler) invoke(n *node, r *http.Request, values json.RawMessage) (err error) {
 	defer func() {
 		if v := recover(); v != nil {
 			err = fmt.Errorf("%w: action: %v", ErrPanic, v)
@@ -988,12 +1086,8 @@ func (h *Handler) invoke(n *node, r *http.Request) (err error) {
 		return ErrNoAction
 	}
 
-	// Read the signals before running anything, and hand the action only the
-	// values of the component that rendered it.
-	values, err := readSignals(r, n.path)
-	if err != nil {
-		return fmt.Errorf("%w: %w", errBadSignals, err)
-	}
-
+	// The action sees only the values of the component that rendered it -
+	// readSignals already descended to its namespace, on the request's own
+	// goroutine.
 	return fn(withSignals(r.Context(), values))
 }

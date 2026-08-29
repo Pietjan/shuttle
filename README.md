@@ -284,8 +284,9 @@ declared — that one is a string an attacker writes, so checking it would let a
 by calling itself an image. `UploadedFile.Type` is what was detected and `DeclaredType` is what was
 claimed. Detection is signature-based, so a container format arrives as its container: a `.docx` is
 a zip. Text is handled (any `text/*` entry accepts detected text, since everything textual detects
-as `text/plain`); for the rest there is `Upload.TrustDeclaredType`, which does what it says and
-makes `Accept` a courtesy for that upload.
+as `text/plain`); for the rest there is `Upload.TrustDeclaredType`, which checks the *declared*
+type against `Accept` instead — a label the client writes, so for that upload the check keeps
+honest files tidy rather than hostile ones out.
 
 Progress uses `XMLHttpRequest`, because `fetch` reports none — that's the whole reason uploads need
 their own path. During an upload the input carries `data-shuttle-uploading` and
@@ -574,7 +575,9 @@ handler.ClientIP = shuttle.ForwardedClientIP(1)   // one trusted proxy in front
 
 `ForwardedClientIP` counts `X-Forwarded-For` from the *end*, since a proxy appends and everything
 before its entry is whatever the client sent — reading the leftmost entry is not a limit at all.
-Getting the hop count wrong degrades rather than opens. `ClientIP` can return anything that
+The hop count must be exact: too low charges the proxy, which degrades safely, but too high reads
+a position the client controls, and a padded header then picks its own bucket — count your
+proxies. `ClientIP` can return anything that
 identifies a caller and that the caller cannot choose freely, such as an account id. IPv6 is charged
 per /64, because the smallest allocation anyone gets is a /64 and a limit per address is a limit per
 attempt.

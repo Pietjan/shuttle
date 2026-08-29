@@ -47,14 +47,16 @@ type Upload struct {
 	// formality: an executable labelled image/png would pass it.
 	Accept []string
 
-	// TrustDeclaredType checks the client's declared content type instead of
-	// the one detected from the bytes.
+	// TrustDeclaredType checks the client's declared content type against
+	// Accept instead of the one detected from the bytes.
 	//
 	// The detection is signature-based, so a container format arrives as its
 	// container: a .docx is a zip and a .csv is text/plain. The second is
 	// handled - any text/* entry accepts detected text - but the first is
 	// not, and cannot be without opening the archive. Set this for those
-	// formats, and know that it makes Accept a courtesy for that upload.
+	// formats, and know that the declared type is a string the client
+	// writes: for that upload, Accept keeps honest files tidy rather than
+	// keeping hostile ones out.
 	TrustDeclaredType bool
 }
 
@@ -173,7 +175,10 @@ func (f *UploadedFile) Save(dir string) (string, error) {
 	if _, err := io.Copy(out, src); err != nil {
 		return "", err
 	}
-	return dst, out.Close()
+	if err := out.Close(); err != nil {
+		return "", err
+	}
+	return dst, nil
 }
 
 // Errors an upload can fail with, all of them the client's doing.
@@ -223,7 +228,15 @@ func receive(part io.Reader, filename, contentType string, spec Upload) (*Upload
 	head = head[:n0]
 
 	detected := http.DetectContentType(head)
-	if !spec.TrustDeclaredType && !spec.acceptsDetected(detected) {
+	if spec.TrustDeclaredType {
+		// The declared type substitutes for the detected one - it does not
+		// waive the check. A flag that quietly accepted everything would
+		// turn "trust the label on containers" into "no type control at
+		// all", which is not what anyone setting it asked for.
+		if !spec.accepts(contentType) {
+			return nil, fmt.Errorf("%w: %s declared as %s", ErrFileType, filename, contentType)
+		}
+	} else if !spec.acceptsDetected(detected) {
 		return nil, fmt.Errorf("%w: %s is %s", ErrFileType, filename, detected)
 	}
 

@@ -130,9 +130,13 @@ func fragment(t *testing.T, page string) string {
 	return page[start:end]
 }
 
-func getPage(t *testing.T, srv *httptest.Server) (page, sid string) {
+func getPage(t *testing.T, srv *httptest.Server, at ...string) (page, sid string) {
 	t.Helper()
-	resp, err := srv.Client().Get(srv.URL + "/")
+	path := "/"
+	if len(at) > 0 {
+		path = at[0]
+	}
+	resp, err := srv.Client().Get(srv.URL + path)
 	if err != nil {
 		t.Fatalf("GET page: %v", err)
 	}
@@ -604,6 +608,10 @@ func TestStaleClickRunsItsOwnClosure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
+	// Grace follows delivery, not minting: a generation the client never
+	// received earns none. markTreeSent is what the page's first paint and
+	// every drained patch do for real.
+	sess.markTreeSent()
 	staleReset := lastPathSegment(clickURLs(t, first)[1])
 
 	// A changed render ships, so the client's markup is now one generation
@@ -613,6 +621,7 @@ func TestStaleClickRunsItsOwnClosure(t *testing.T) {
 	if _, err := sess.Render(ctx); err != nil {
 		t.Fatalf("re-render: %v", err)
 	}
+	sess.markTreeSent()
 
 	if err := sess.Invoke(ctx, "c", staleReset); err != nil {
 		t.Fatalf("stale click rejected: %v", err)
@@ -627,10 +636,12 @@ func TestStaleClickRunsItsOwnClosure(t *testing.T) {
 	if _, err := sess.Render(ctx); err != nil {
 		t.Fatalf("re-render: %v", err)
 	}
+	sess.markTreeSent()
 	c.Count = 9
 	if _, err := sess.Render(ctx); err != nil {
 		t.Fatalf("re-render: %v", err)
 	}
+	sess.markTreeSent()
 	if err := sess.Invoke(ctx, "c", staleReset); !errors.Is(err, ErrNoAction) {
 		t.Errorf("long-stale click: err = %v, want ErrNoAction", err)
 	}
@@ -693,10 +704,14 @@ func TestUnknownSessionAndAction(t *testing.T) {
 	}
 }
 
-// TestSecondStreamIsRejected: one stream per page. A second would give the
-// session two writers and lose the ordering guarantee that makes the single
-// stream worth having.
-func TestSecondStreamIsRejected(t *testing.T) {
+// TestSecondStreamTakesOver: one stream per page, and the newest attempt is
+// the one that gets it. Refusing the second was the old rule, and it needed
+// liveness detection to be safe: a client that vanished without closing its
+// connection held the slot until a heartbeat write failed - or forever with
+// the heartbeat disabled - and every reconnect in that window bounced off a
+// stream nobody was reading. The session id is a capability, so a second
+// holder is almost always the same client's newer attempt.
+func TestSecondStreamTakesOver(t *testing.T) {
 	h := New(func() Component { return &counter{} })
 	srv := httptest.NewServer(h)
 	// Registered rather than deferred: a stream is a long-lived request, and
@@ -705,21 +720,18 @@ func TestSecondStreamIsRejected(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	_, sid := getPage(t, srv)
+	first := openStream(t, srv, sid)
+
+	// The second attaches and greets like any stream; openStream fails the
+	// test on anything but a live 200.
 	openStream(t, srv, sid)
 
-	second, err := http.NewRequest(http.MethodGet, srv.URL+routePrefix+"/live", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	second.Header.Set(SessionHeader, sid)
-	resp, err := srv.Client().Do(second)
-	if err != nil {
-		t.Fatalf("second stream: %v", err)
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
-	if resp.StatusCode != http.StatusConflict {
-		t.Errorf("second stream: status %d, want 409", resp.StatusCode)
+	// And the first is cancelled by the takeover rather than left running as
+	// a competing writer.
+	select {
+	case <-first.errs:
+	case <-time.After(3 * time.Second):
+		t.Error("displaced stream was left open")
 	}
 }
 
@@ -1206,4 +1218,44 @@ func waitFor(t *testing.T, within time.Duration, cond func() bool, what string) 
 		time.Sleep(2 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", what)
+}
+
+// TestHeadCostsNothing. ServeMux routes HEAD through GET patterns, and both
+// GET routes here have state attached: the page mints a session per
+// request, and the stream claims the session's single slot with a response
+// whose writes are silently dropped - a stream that can never carry a
+// patch, wedging the real one out.
+func TestHeadCostsNothing(t *testing.T) {
+	h := New(func() Component { return &counter{} })
+	h.Logger = quietLogger()
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	head, err := srv.Client().Head(srv.URL + "/")
+	if err != nil {
+		t.Fatalf("HEAD page: %v", err)
+	}
+	head.Body.Close()
+	if head.StatusCode != http.StatusOK {
+		t.Errorf("HEAD page: status %d, want 200", head.StatusCode)
+	}
+	if got := h.sessions.len(); got != 0 {
+		t.Errorf("HEAD minted %d sessions, want 0", got)
+	}
+
+	_, sid := getPage(t, srv)
+
+	req, err := http.NewRequest(http.MethodHead, srv.URL+routePrefix+"/live", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(SessionHeader, sid)
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("HEAD stream: %v", err)
+	}
+	resp.Body.Close()
+
+	// The slot is still free: a real stream attaches and greets.
+	openStream(t, srv, sid)
 }

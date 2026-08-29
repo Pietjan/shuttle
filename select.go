@@ -1,6 +1,7 @@
 package shuttle
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 
@@ -14,24 +15,30 @@ import (
 //
 //	button                  a tag
 //	#save                   an id
-//	.rounded                a class
+//	.rounded.border         classes, compounded
 //	[data-ui=button]        an attribute, with or without a value
 //	div[data-shuttle] span  descendants
 //
-// No combinators beyond descendant, no pseudo-classes. A component test
-// that needs more than this is usually asserting on the wrong thing.
+// No combinators beyond descendant, no pseudo-classes, no attribute
+// operators. A component test that needs more than this is usually
+// asserting on the wrong thing.
+//
+// What it does not support it REFUSES, loudly. The alternative - parsing
+// what it understands and quietly matching nothing - turns every Missing()
+// and Count(x, 0) over a typo'd or unsupported selector into a pass, which
+// is a test asserting that the engine has limits.
 
 // selector is a chain of steps, each of which must match an ancestor of the
 // next.
 type selector []step
 
-// step is one compound selector: at most one tag, id and class, and any
-// number of attribute conditions.
+// step is one compound selector: at most one tag and id, any number of
+// classes and attribute conditions.
 type step struct {
-	tag   string
-	id    string
-	class string
-	attrs []attrCond
+	tag     string
+	id      string
+	classes []string
+	attrs   []attrCond
 }
 
 type attrCond struct {
@@ -40,19 +47,65 @@ type attrCond struct {
 	exact bool
 }
 
-// parseSelector reads a selector, returning nil if it is empty.
-func parseSelector(s string) selector {
-	var sel selector
-	for part := range strings.FieldsSeq(s) {
-		if st, ok := parseStep(part); ok {
-			sel = append(sel, st)
-		}
+// parseSelector reads a selector, returning an error for anything it does
+// not fully understand.
+func parseSelector(s string) (selector, error) {
+	if strings.TrimSpace(s) == "" {
+		return nil, fmt.Errorf("shuttle: empty selector")
 	}
-	return sel
+	var sel selector
+	for _, part := range splitSteps(s) {
+		st, err := parseStep(part)
+		if err != nil {
+			return nil, err
+		}
+		sel = append(sel, st)
+	}
+	return sel, nil
 }
 
-func parseStep(s string) (step, bool) {
+// splitSteps splits on whitespace outside brackets, so [title="hello
+// world"] stays one step.
+func splitSteps(s string) []string {
+	var parts []string
+	var b strings.Builder
+	depth := 0
+	var quote byte
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case quote != 0:
+			if c == quote {
+				quote = 0
+			}
+			b.WriteByte(c)
+		case c == '"' || c == '\'':
+			quote = c
+			b.WriteByte(c)
+		case c == '[':
+			depth++
+			b.WriteByte(c)
+		case c == ']':
+			depth--
+			b.WriteByte(c)
+		case depth == 0 && (c == ' ' || c == '\t' || c == '\n'):
+			if b.Len() > 0 {
+				parts = append(parts, b.String())
+				b.Reset()
+			}
+		default:
+			b.WriteByte(c)
+		}
+	}
+	if b.Len() > 0 {
+		parts = append(parts, b.String())
+	}
+	return parts
+}
+
+func parseStep(s string) (step, error) {
 	var st step
+	orig := s
 
 	// Attributes first, so the tag/id/class scan sees a clean prefix.
 	for {
@@ -60,37 +113,85 @@ func parseStep(s string) (step, bool) {
 		if open < 0 {
 			break
 		}
-		close := strings.IndexByte(s[open:], ']')
-		if close < 0 {
-			break
+		end := closingBracket(s, open)
+		if end < 0 {
+			return st, fmt.Errorf("shuttle: selector %q: unterminated [", orig)
 		}
-		close += open
 
-		cond := s[open+1 : close]
+		cond := s[open+1 : end]
 		if before, after, ok := strings.Cut(cond, "="); ok {
+			key := strings.TrimSpace(before)
+			if len(key) > 0 && strings.ContainsAny(key[len(key)-1:], "^$*~|") {
+				return st, fmt.Errorf("shuttle: selector %q: attribute operators are not supported, only [k] and [k=v]", orig)
+			}
 			st.attrs = append(st.attrs, attrCond{
-				key:   strings.TrimSpace(before),
+				key:   key,
 				val:   strings.Trim(strings.TrimSpace(after), `"'`),
 				exact: true,
 			})
 		} else {
 			st.attrs = append(st.attrs, attrCond{key: strings.TrimSpace(cond)})
 		}
-		s = s[:open] + s[close+1:]
+		s = s[:open] + s[end+1:]
+	}
+
+	if i := strings.IndexAny(s, ">+~,:*()"); i >= 0 {
+		return st, fmt.Errorf("shuttle: selector %q: %q is not supported - tags, #id, .class, [attr] and descendants only", orig, s[i])
 	}
 
 	for s != "" {
 		switch s[0] {
 		case '#':
-			st.id, s = scanName(s[1:])
+			var id string
+			id, s = scanName(s[1:])
+			if id == "" {
+				return st, fmt.Errorf("shuttle: selector %q: # with no id", orig)
+			}
+			if st.id != "" {
+				return st, fmt.Errorf("shuttle: selector %q: two ids in one step", orig)
+			}
+			st.id = id
 		case '.':
-			st.class, s = scanName(s[1:])
+			var class string
+			class, s = scanName(s[1:])
+			if class == "" {
+				return st, fmt.Errorf("shuttle: selector %q: . with no class", orig)
+			}
+			st.classes = append(st.classes, class)
 		default:
-			st.tag, s = scanName(s)
+			var tag string
+			tag, s = scanName(s)
+			if st.tag != "" {
+				return st, fmt.Errorf("shuttle: selector %q: two tags in one step", orig)
+			}
+			st.tag = tag
 		}
 	}
 
-	return st, st.tag != "" || st.id != "" || st.class != "" || len(st.attrs) > 0
+	if st.tag == "" && st.id == "" && len(st.classes) == 0 && len(st.attrs) == 0 {
+		return st, fmt.Errorf("shuttle: selector %q: empty step", orig)
+	}
+	return st, nil
+}
+
+// closingBracket finds the ] ending the condition opened at open, skipping
+// any that sit inside a quoted value.
+func closingBracket(s string, open int) int {
+	var quote byte
+	for i := open + 1; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case quote != 0:
+			if c == quote {
+				quote = 0
+			}
+		case c == '"' || c == '\'':
+			quote = c
+		case c == ']':
+			return i
+		}
+	}
+	return -1
 }
 
 // scanName reads up to the next '#' or '.'.
@@ -114,8 +215,10 @@ func (st step) matches(n *html.Node) bool {
 	if st.id != "" && attr(n, "id") != st.id {
 		return false
 	}
-	if st.class != "" && !hasClass(n, st.class) {
-		return false
+	for _, class := range st.classes {
+		if !hasClass(n, class) {
+			return false
+		}
 	}
 	for _, c := range st.attrs {
 		v, ok := lookupAttr(n, c.key)
@@ -146,10 +249,15 @@ func hasClass(n *html.Node, class string) bool {
 
 // selectAll returns every element in markup matching sel, in document
 // order.
+//
+// Every element is tested against the final step and its ancestor chain
+// against the rest, rather than walking with a single advancing depth - the
+// depth walk stopped searching inside anything that matched, so a .item
+// nested in a .item was invisible and Count undercounted silently.
 func selectAll(markup, sel string) ([]*html.Node, error) {
-	steps := parseSelector(sel)
-	if len(steps) == 0 {
-		return nil, nil
+	steps, err := parseSelector(sel)
+	if err != nil {
+		return nil, err
 	}
 
 	root, err := html.Parse(strings.NewReader(markup))
@@ -158,22 +266,33 @@ func selectAll(markup, sel string) ([]*html.Node, error) {
 	}
 
 	var found []*html.Node
-	var walk func(n *html.Node, depth int)
-	walk = func(n *html.Node, depth int) {
-		next := depth
-		if depth < len(steps) && steps[depth].matches(n) {
-			next = depth + 1
-			if next == len(steps) {
-				found = append(found, n)
-			}
+	var walk func(n *html.Node)
+	walk = func(n *html.Node) {
+		if matchesChain(n, steps) {
+			found = append(found, n)
 		}
 		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			walk(c, next)
+			walk(c)
 		}
 	}
-	walk(root, 0)
+	walk(root)
 
 	return found, nil
+}
+
+// matchesChain reports whether n matches the last step with ancestors
+// satisfying the rest, nearest-last, which is the descendant combinator.
+func matchesChain(n *html.Node, steps selector) bool {
+	if len(steps) == 0 || !steps[len(steps)-1].matches(n) {
+		return false
+	}
+	i := len(steps) - 2
+	for a := n.Parent; a != nil && i >= 0; a = a.Parent {
+		if steps[i].matches(a) {
+			i--
+		}
+	}
+	return i < 0
 }
 
 // applyPatch applies one patch to the kit's copy of the page, the way the
@@ -235,6 +354,20 @@ func applyPatch(markup, id, replacement string, mode datastar.ElementPatchMode) 
 		nodes, ok := parseIn(parent, replacement)
 		if !ok {
 			return markup, false
+		}
+		// The patched element itself an ignored container, replaced by an
+		// ignored container: Datastar skips such a pair outright, so the
+		// whole patch is a no-op. Modelled here before keepIgnored, whose
+		// swap would otherwise tear the target out of the tree and then
+		// try to insert relative to it.
+		if _, ok := lookupAttr(target, "data-ignore-morph"); ok {
+			for _, n := range nodes {
+				if n.Type == html.ElementNode && attr(n, "id") == id {
+					if _, ok := lookupAttr(n, "data-ignore-morph"); ok {
+						return markup, true
+					}
+				}
+			}
 		}
 		nodes = keepIgnored(doc, nodes)
 		place(parent, nodes, target)

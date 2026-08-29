@@ -161,7 +161,7 @@ func TestURLDoesNotMoveWhenNothingChanged(t *testing.T) {
 
 	// Queue one more item behind them: the mailbox is first-in-first-out, so
 	// when this returns the three re-renders have happened.
-	if err := sess.call(func() error { return nil }); err != nil {
+	if err := sess.call(ctx, func() error { return nil }); err != nil {
 		t.Fatalf("sync: %v", err)
 	}
 
@@ -185,10 +185,10 @@ func TestNavigateAndReplace(t *testing.T) {
 	// HandleParams synchronously on whichever goroutine calls them - and
 	// HandleParams writes component fields, which the session is rendering
 	// from. An action is already there; a test is not.
-	if err := sess.call(func() error { return c.Navigate(ctx, "/?filter=mine") }); err != nil {
+	if err := sess.call(ctx, func() error { return c.Navigate(ctx, "/?filter=mine") }); err != nil {
 		t.Fatalf("navigate: %v", err)
 	}
-	if err := sess.call(func() error {
+	if err := sess.call(ctx, func() error {
 		if c.Filter != "mine" {
 			t.Errorf("Navigate did not apply the params: filter = %q", c.Filter)
 		}
@@ -221,7 +221,7 @@ func TestRedirectLeavesTheSession(t *testing.T) {
 	if _, err := sess.Render(context.Background()); err != nil {
 		t.Fatalf("render: %v", err)
 	}
-	if err := sess.call(func() error {
+	if err := sess.call(context.Background(), func() error {
 		return c.Redirect(context.Background(), "/login")
 	}); err != nil {
 		t.Fatalf("redirect: %v", err)
@@ -310,6 +310,40 @@ func TestNavRejectsRubbish(t *testing.T) {
 	// reaching the session lookup.
 	if code := postBody(t, srv, "deadbeef", routePrefix+"/nav", `{"url":"/"}`); code != http.StatusNotFound {
 		t.Errorf("unknown session: status %d, want 404", code)
+	}
+}
+
+// TestNavStaysInsideTheMount. The reported URL is client input and
+// Session.Path is what a Subtree component routes on, so an unchecked value
+// would move the session to any path on the server without that path ever
+// passing the middleware mounted in front of this handler. Legitimate
+// navigation is only ever history this handler wrote, and it wrote nothing
+// outside its own mount.
+func TestNavStaysInsideTheMount(t *testing.T) {
+	h := New(func() Component { return &table{} })
+	h.Logger = quietLogger()
+	h.Prefix = "/app"
+	mux := http.NewServeMux()
+	mux.Handle("/app/", h)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	_, sid := getPage(t, srv, "/app/")
+
+	for name, u := range map[string]string{
+		"an absolute URL":         "https://example.com/app/",
+		"a schemeless host":       "//example.com/app/",
+		"a path outside the app":  "/admin/users",
+		"a prefix-shaped sibling": "/appendix",
+	} {
+		if code := postBody(t, srv, sid, "/app"+routePrefix+"/nav", `{"url":"`+u+`"}`); code != http.StatusBadRequest {
+			t.Errorf("%s: status %d, want 400", name, code)
+		}
+	}
+
+	// The paths the handler actually wrote still navigate.
+	if code := postBody(t, srv, sid, "/app"+routePrefix+"/nav", `{"url":"/app/?filter=archived"}`); code != http.StatusNoContent {
+		t.Errorf("a path under the mount: status %d, want 204", code)
 	}
 }
 

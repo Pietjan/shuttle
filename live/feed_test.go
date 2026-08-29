@@ -284,3 +284,59 @@ func (p *pair) Render(ctx context.Context) templ.Component {
 		return b.Render(ctx, w)
 	})
 }
+
+// TestAnOverstatedTotalStopsAtTheEmptyPage. Totals overstate for mundane
+// reasons - rows deleted between pages, a cached count - and a feed that
+// kept trusting one past an empty answer would re-arm its sentinel against
+// a source with nothing left: a request loop bounded only by the session's
+// budget.
+func TestAnOverstatedTotalStopsAtTheEmptyPage(t *testing.T) {
+	f := newFeed(posts(5), 100)
+	l := shuttle.Test(t, f)
+
+	l.Intersect("[data-shuttle-sentinel]") // rows 3-4: a short page, but Total says go on
+	l.Intersect("[data-shuttle-sentinel]") // the empty page, which is final
+
+	if !f.Done() {
+		t.Error("an empty page did not end the feed")
+	}
+	l.Assert().Missing("[data-shuttle-sentinel]")
+	if f.Loaded() != 5 {
+		t.Errorf("Loaded() = %d, want the 5 that exist", f.Loaded())
+	}
+}
+
+// TestRetryAfterAFirstPageFailureRecoversTheFirstPage. The recovered page
+// has to land in the component as well as the stream: first is what a
+// fresh full render shows, and a reconnect outside the grace window is
+// exactly such a render - an empty first over a healthy source would make
+// that page come back blank.
+func TestRetryAfterAFirstPageFailureRecoversTheFirstPage(t *testing.T) {
+	calls := 0
+	f := &live.Feed[string]{
+		Load: func(ctx context.Context, q live.Query) (live.Page[string], error) {
+			if calls++; calls == 1 {
+				return live.Page[string]{}, errors.New("database asleep")
+			}
+			return loadPosts(posts(5), 5)(ctx, q)
+		},
+		Item:     func(s string) templ.Component { return live.Text(s) },
+		PageSize: 3,
+	}
+	l := shuttle.Test(t, f)
+
+	if f.Err() == nil {
+		t.Fatal("the first load did not fail")
+	}
+	l.Click("[data-shuttle-feed-error] button")
+
+	if f.Err() != nil {
+		t.Fatalf("retry did not clear the failure: %v", f.Err())
+	}
+	if f.Held() != 3 {
+		t.Errorf("Held() = %d, want the recovered first page of 3", f.Held())
+	}
+	if f.Loaded() != 3 {
+		t.Errorf("Loaded() = %d, want 3", f.Loaded())
+	}
+}

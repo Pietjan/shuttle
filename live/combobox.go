@@ -82,14 +82,45 @@ type Combobox struct {
 	selected *Choice
 	searched bool
 	failed   error
+	// searches counts them, and is what data-shuttle-open carries while the
+	// panel should be open. The shim only acts on that attribute when its
+	// value changes, so a plain boolean would go stale against light
+	// dismiss: Escape closes the panel in the browser alone, the server
+	// still says "true", and the next unrelated patch would pop it back
+	// open. A counter makes each search a new instruction and everything
+	// else a repeat the shim ignores.
+	searches int
 }
 
 // Selected returns the chosen option, or nil.
 func (c *Combobox) Selected() *Choice { return c.selected }
 
-// Query is the client-side signal holding what has been typed.
+// Select presets or clears the selection - editing an existing record is a
+// combobox that starts with a value. Call it from the parent's Mount or an
+// action; it does not run OnSelect, which is for the user's choices rather
+// than the program's.
+func (c *Combobox) Select(choice *Choice) {
+	if choice == nil {
+		c.selected = nil
+		return
+	}
+	picked := *choice
+	c.selected = &picked
+	// The field shows what is chosen. Ignored when nothing is listening
+	// yet, which is a preset before first render - the signal declaration
+	// carries the value there instead; see Signals.
+	_ = c.PatchSignal("query", picked.Label)
+}
+
+// Query is the client-side signal holding what has been typed. A preset
+// selection seeds it, so an edit form's combobox first renders with its
+// current value in the field.
 func (c *Combobox) Signals() map[string]any {
-	return map[string]any{"query": ""}
+	q := ""
+	if c.selected != nil {
+		q = c.selected.Label
+	}
+	return map[string]any{"query": q}
 }
 
 // Choices returns what the last search found.
@@ -118,13 +149,16 @@ func (c *Combobox) search(ctx context.Context) error {
 		return err
 	}
 
-	c.searched = true
-	c.failed = nil
-
 	if c.Search == nil {
-		c.choices = nil
+		// Half-configured stays inert: announcing "No matches." for a
+		// search that never ran would be the component lying about itself.
+		c.choices, c.searched = nil, false
 		return nil
 	}
+
+	c.searched = true
+	c.searches++
+	c.failed = nil
 
 	choices, err := c.Search(ctx, f.Query)
 	if err != nil {
@@ -152,6 +186,13 @@ func (c *Combobox) choose(ctx context.Context, choice Choice) error {
 	// says with data-shuttle-open and the shim carries out.
 	c.choices, c.searched = nil, false
 
+	// The field shows the choice. A targeted signal write, because renders
+	// deliberately cannot overwrite the client's typing - and after a
+	// choice, what was typed is exactly what should be replaced.
+	if err := c.PatchSignal("query", picked.Label); err != nil {
+		return err
+	}
+
 	if c.OnSelect != nil {
 		return c.OnSelect(ctx, picked)
 	}
@@ -164,28 +205,23 @@ func (c *Combobox) Render(ctx context.Context) templ.Component {
 	// panel survives, since a popover's open state lives on the element.
 	stem := shuttle.ElementID(ctx, "combobox")
 
-	// Open exactly when there is something to show. The shim reads this and
+	// Open exactly when a search has run: it always has something to show,
+	// since emptyMessage never returns nothing. The shim reads this and
 	// calls showPopover/hidePopover, which is the one thing the markup
 	// cannot say for itself.
-	open := c.searched && (len(c.choices) > 0 || c.failed != nil || c.emptyMessage() != "")
+	open := c.searched
 
-	field := combobox.Input(
+	fieldOpts := []combobox.Option{
 		combobox.Placeholder(c.Placeholder),
 		combobox.Attr("aria-label", c.label()),
 		shuttle.Bind(ctx, combobox.Attr, "query"),
 		shuttle.OnChange(ctx, combobox.Attr, c.debounce(), c.search),
 		combobox.Attr("data-shuttle-rove-field", ""),
-	)
-	if open {
-		field = combobox.Input(
-			combobox.Placeholder(c.Placeholder),
-			combobox.Attr("aria-label", c.label()),
-			combobox.Expanded(),
-			shuttle.Bind(ctx, combobox.Attr, "query"),
-			shuttle.OnChange(ctx, combobox.Attr, c.debounce(), c.search),
-			combobox.Attr("data-shuttle-rove-field", ""),
-		)
 	}
+	if open {
+		fieldOpts = append(fieldOpts, combobox.Expanded())
+	}
+	field := combobox.Input(fieldOpts...)
 
 	rows := make([]templ.Component, 0, len(c.choices))
 	for _, choice := range c.choices {
@@ -219,12 +255,22 @@ func (c *Combobox) Render(ctx context.Context) templ.Component {
 			combobox.Name(stem),
 			combobox.Attr("data-shuttle-roving", ""),
 			// What the shim acts on. An attribute rather than a signal: it
-			// is a fact about this render, not client state.
-			combobox.Attr("data-shuttle-open", strconv.FormatBool(open)),
+			// is a fact about this render, not client state. The open value
+			// is the search counter, not "true" - see the searches field.
+			combobox.Attr("data-shuttle-open", c.openValue(open)),
 		),
 		field,
 		with(combobox.List(), body...),
 	)
+}
+
+// openValue renders the state the shim syncs the popover to: "false" when
+// closed, the search counter while open.
+func (c *Combobox) openValue(open bool) string {
+	if !open {
+		return "false"
+	}
+	return strconv.Itoa(c.searches)
 }
 
 // label names the control for assistive tech. A placeholder is not a name,

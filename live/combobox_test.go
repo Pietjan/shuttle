@@ -228,3 +228,52 @@ func TestComboboxEmptyMessage(t *testing.T) {
 	l.Signal("query", "zzz").Change("[data-shuttle-rove-field]")
 	l.Assert().TextContains("[data-ui=combobox-empty]", "Nobody by that name.")
 }
+
+// TestComboboxOpenValueIsACounter, not a boolean, and that is the whole
+// light-dismiss story: the shim only acts on the attribute when its value
+// changes, so Escape's client-side close survives every later patch - a
+// stale "true" re-applied would pop the panel back open - while each new
+// search mints a new value and reopens it.
+func TestComboboxOpenValueIsACounter(t *testing.T) {
+	box := &live.Combobox{Search: findPeople}
+	l := shuttle.Test(t, newPage(box))
+
+	l.Assert().Attr("[data-shuttle-open]", "data-shuttle-open", "false")
+
+	l.Signal("query", "ada").Change("[data-shuttle-rove-field]")
+	l.Assert().Attr("[data-shuttle-open]", "data-shuttle-open", "1")
+
+	l.Signal("query", "grace").Change("[data-shuttle-rove-field]")
+	l.Assert().Attr("[data-shuttle-open]", "data-shuttle-open", "2")
+
+	l.Click("[data-shuttle-rove-item]")
+	l.Assert().Attr("[data-shuttle-open]", "data-shuttle-open", "false")
+}
+
+// TestComboboxWithoutASearchStaysShut. Announcing "No matches." for a
+// search that never ran would be the component lying about itself.
+func TestComboboxWithoutASearchStaysShut(t *testing.T) {
+	l := shuttle.Test(t, newPage(&live.Combobox{}))
+
+	l.Signal("query", "anything").Change("[data-shuttle-rove-field]")
+	l.Assert().Attr("[data-shuttle-open]", "data-shuttle-open", "false")
+}
+
+// TestComboboxSelectPresetsTheField: editing an existing record is a
+// combobox that starts with a value, and the field's signal declaration
+// seeds it so the first render already shows it.
+func TestComboboxSelectPresetsTheField(t *testing.T) {
+	box := &live.Combobox{Search: findPeople}
+	box.Select(&live.Choice{Value: "Grace Hopper", Label: "Grace Hopper"})
+	l := shuttle.Test(t, newPage(box))
+
+	if got := box.Selected(); got == nil || got.Value != "Grace Hopper" {
+		t.Fatalf("Selected() = %v, want the preset", got)
+	}
+	l.Assert().Contains(`data-signals:c.1.query__ifmissing="&#34;Grace Hopper&#34;"`)
+
+	box.Select(nil)
+	if box.Selected() != nil {
+		t.Error("Select(nil) did not clear the selection")
+	}
+}

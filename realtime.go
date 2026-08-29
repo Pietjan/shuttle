@@ -165,13 +165,23 @@ type PresenceEvent struct {
 // presence tracks who is on each topic. It is per-Broker rather than
 // global, and in-process: a multi-node deployment needs the members shared
 // the same way messages are, which is a job for the Broker that owns them.
+//
+// Membership is counted, not flagged: presence is keyed by session, but
+// joining happens per component, and two components on one page can join
+// the same topic. Without the count, the first of them to unmount would
+// announce the whole page's departure while the other was still listening.
 type presence struct {
 	mu     sync.RWMutex
-	topics map[string]map[string]Member
+	topics map[string]map[string]presenceEntry
+}
+
+type presenceEntry struct {
+	member Member
+	refs   int
 }
 
 func newPresence() *presence {
-	return &presence{topics: map[string]map[string]Member{}}
+	return &presence{topics: map[string]map[string]presenceEntry{}}
 }
 
 func (p *presence) join(topic, tag string, meta any) (Member, bool) {
@@ -180,13 +190,14 @@ func (p *presence) join(topic, tag string, meta any) (Member, bool) {
 
 	members, ok := p.topics[topic]
 	if !ok {
-		members = map[string]Member{}
+		members = map[string]presenceEntry{}
 		p.topics[topic] = members
 	}
-	m := Member{Tag: tag, Meta: meta}
-	_, rejoin := members[tag]
-	members[tag] = m
-	return m, !rejoin
+	e, rejoin := members[tag]
+	e.member = Member{Tag: tag, Meta: meta}
+	e.refs++
+	members[tag] = e
+	return e.member, !rejoin
 }
 
 func (p *presence) leave(topic, tag string) (Member, bool) {
@@ -197,15 +208,20 @@ func (p *presence) leave(topic, tag string) (Member, bool) {
 	if !ok {
 		return Member{}, false
 	}
-	m, ok := members[tag]
+	e, ok := members[tag]
 	if !ok {
+		return Member{}, false
+	}
+	e.refs--
+	if e.refs > 0 {
+		members[tag] = e
 		return Member{}, false
 	}
 	delete(members, tag)
 	if len(members) == 0 {
 		delete(p.topics, topic)
 	}
-	return m, true
+	return e.member, true
 }
 
 func (p *presence) list(topic string) []Member {
@@ -213,8 +229,8 @@ func (p *presence) list(topic string) []Member {
 	defer p.mu.RUnlock()
 
 	members := make([]Member, 0, len(p.topics[topic]))
-	for _, m := range p.topics[topic] {
-		members = append(members, m)
+	for _, e := range p.topics[topic] {
+		members = append(members, e.member)
 	}
 	sort.Slice(members, func(i, j int) bool {
 		return members[i].Tag < members[j].Tag

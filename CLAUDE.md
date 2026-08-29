@@ -112,6 +112,19 @@ component's fields need no locks of their own.** It also removes a whole class o
 marks the component dirty rather than rendering, and `Do` queues rather than waiting, so both are
 safe to call from inside an action, where waiting would be waiting on yourself.
 
+**The mailbox is unbounded, and that is load-bearing rather than laziness.** It was a 64-deep
+channel, and the in-memory broker delivers on the publisher's goroutine — so an action publishing
+to a topic its own session subscribed to fed its own mailbox from the one goroutine that drains it,
+and enough messages wedged the session permanently (two sessions cross-publishing deadlocked the
+same way). Client-driven work is bounded by the request budget; what arrives outside a request must
+never be able to block. `TestPublishingToYourOwnTopicCannotWedgeTheSession` pins it.
+
+**Session teardown runs on the session's goroutine too.** `close` queues the unmount behind
+whatever is in flight and waits for it, so `Unmount` and the cleanup funcs can never race an action
+mid-execution — the old shape ran them on the caller's goroutine, which broke the one rule every
+component is written against. Consequence: never call `Session.close` from the session's own
+goroutine.
+
 Marking dirty rather than queueing renders is also what makes coalescing free — the dirty set can
 never hold more than one entry per component, so ten pushes in a row cost one render.
 
@@ -230,9 +243,14 @@ Three more decisions worth knowing before touching this code:
   the session id, which is unguessable, so an id only has to be unambiguous — and determinism is
   what lets a test compare two renders byte for byte. The generation prefix is load-bearing:
   position 1 of the next render may be a different button, so an id naming only its position would
-  let a click sent against markup a morph has already replaced run the wrong closure. Two
-  generations of table are kept live, so a click racing a morph still runs its own closure.
-  Note that position follows the order `OnClick` is *called*, not document order.
+  let a click sent against markup a morph has already replaced run the wrong closure. The current
+  table plus the last **delivered** one are kept live, so a click racing a morph still runs its own
+  closure. Delivered, not merely minted: renders coalesce, so generations can be superseded before
+  the stream ships them, and granting those grace would push out the one the client actually holds
+  — a click after two undelivered renders was a spurious 404. `take` marks a subtree sent when its
+  patch is drained, the page's first paint marks the whole tree, and
+  `TestGraceFollowsDeliveryNotMinting` pins it. Note that position follows the order `OnClick` is
+  *called*, not document order.
 - **One pending render, not a queue.** Every patch carries the region's complete state, so a client
   that can't keep up should skip intermediate renders rather than accumulate them. `Session.Push`
   overwrites the slot and never blocks on the client, which is most of the backpressure problem
@@ -361,6 +379,31 @@ hook rather than duplicating itself into `Mount`.
 approximated. `live.Combobox` is filter-as-you-type; `live.Table[T]` is sort/filter/paginate holding
 one page; `live.Feed[T]` is infinite scroll, holding one page as well.
 
+A hardening pass over the kit fixed a cluster of edge cases, each with a pinning test:
+
+- **`Column.Cell` takes `ctx`**, so a cell can carry bindings — per-row buttons were impossible
+  without it, which was the kit's biggest usability gap.
+- **`Table.Param` namespaces the URL keys** (`u-q`, `u-sort`, …). The keys were hard-coded
+  literals, so two tables on a page fought over the query string and no app could avoid it.
+- **An offset past the end snaps to the real last page** (`?page=99` rendered "491–490 of 15"),
+  **hiding the sorted column un-sorts** (the third heading click was the only way back and hiding
+  removed it), and a **URL hiding every column un-hides the fallback** so the picker, the URL and
+  the screen agree.
+- **`HandleParams` writes a changed filter back to the client signal** via `Base.PatchSignal` —
+  `__ifmissing` rightly stops renders clobbering typing, but the back button restoring `?q=` must
+  reach the box. `PatchSignal` is the core's new explicit, targeted signal write for exactly these
+  moments; `Combobox` uses it too, writing the chosen label into its field.
+- **`Combobox.Select` presets or clears a selection** (an edit form's combobox starts with a
+  value), a nil `Search` stays inert instead of announcing "No matches.", and
+  **`data-shuttle-open` carries a search counter, not a boolean** — the shim acts on the attribute
+  only when its value changes, which is what lets Escape's client-side dismissal survive later
+  patches (a stale `true` re-applied used to pop the panel back open) while each new search still
+  reopens it.
+- **`Feed` treats an empty page as final whatever `Total` claims** (an overstating source was an
+  infinite sentinel loop), advances its cursor by what was actually appended (a mid-stream failure
+  no longer double-appends on retry), and a first-page failure retried lands in `first` as well as
+  the stream, so `Held()` and a fresh full render stay truthful.
+
 **The table holds its shape**, because one that resizes on every sort, page and keystroke throws the
 page around under the cursor. Measured before and after on the same five steps — initial, sorted,
 page 3, filtered, no matches:
@@ -482,18 +525,24 @@ synonym but an error, and an erroring attribute takes the rest of that element's
 `OnEvent` and `OnIntersect` now share `onAttr`, which takes the attribute name for exactly this
 reason. Free in core v1.0.2, not Pro; verified in the bundle.
 
-**A sentinel fires on a transition, so what re-arms it is the action id changing.** An
+**A sentinel fires on a transition, so what re-arms it is its attribute value changing.** An
 IntersectionObserver reports entering the viewport, so a first page too short to push the sentinel
 off screen would leave a feed stopped with more to give — the classic stall. What prevents it was
 read out of the v1.0.2 bundle rather than hoped for: Datastar's mutation observer re-applies a
-plugin when its attribute *value* changes, and every render writes a new `<gen>-a<n>`, so the plugin
-is re-applied, a fresh `IntersectionObserver` observes the element, and `observe` always delivers an
-initial callback with the current state. Still on screen, so it fires again, until the viewport is
-full or no sentinel is rendered. The bundle applies the new plugin *before* running the old
-cleanup, so the element is never unobserved in between. `TestAShortFirstPageDoesNotStall` is that
-mechanism end to end, in a browser, with no scrolling at all — and it is the test to run first if
-any of this is touched, because every other symptom of getting it wrong looks like "the feed
-sometimes stops".
+plugin when its attribute *value* changes, so the plugin is re-applied, a fresh
+`IntersectionObserver` observes the element, and `observe` always delivers an initial callback with
+the current state. Still on screen, so it fires again, until the viewport is full or no sentinel is
+rendered. The bundle applies the new plugin *before* running the old cleanup, so the element is
+never unobserved in between.
+
+This used to lean on "every render writes a new `<gen>-a<n>`" — and the generations-on-change
+commit quietly broke it: a `more` that changes nothing in the feed's *own* markup (the loaded rows
+live in the ignored container, not in the render) kept its bytes, kept its generation, and the
+sentinel never re-armed — the feed stalled after exactly one extra page, in the browser, with every
+unit test green. The sentinel now carries `data-shuttle-sentinel="<sent>"`, the offset its next
+firing will ask for, so the render after each load always differs by at least that. The e2e feed
+tests are the ones that catch this class of break; run them first if any of this is touched,
+because every other symptom of getting it wrong looks like "the feed sometimes stops".
 
 Two consequences of firing repeatedly. The action has to advance a cursor rather than read one, and
 **exhaustion is expressed by not rendering the sentinel** — nothing else stops the asking. So is
@@ -589,11 +638,14 @@ POST without one did not come from a page.
 **Uploads check the bytes.** `Accept` used to be matched against the multipart part's declared
 content type, which is a string the client writes — so an executable calling itself `image/png`
 passed, and the check was a formality dressed as a control. `receive` sniffs the first 512 bytes
-before writing anything, and the declared type is recorded as `DeclaredType` and never acted on. The
-declared pre-check was removed rather than kept alongside: once the bytes decide, a label check can
-only reject genuine files that a browser happened to send as `application/octet-stream`. Detection is
-signature-based, hence the `text/*` allowance (everything textual detects as `text/plain`) and
-`TrustDeclaredType` for container formats.
+before writing anything, and the declared type is recorded as `DeclaredType` and never acted on in
+the default path. The declared pre-check was removed rather than kept alongside: once the bytes
+decide, a label check can only reject genuine files that a browser happened to send as
+`application/octet-stream`. Detection is signature-based, hence the `text/*` allowance (everything
+textual detects as `text/plain`) and `TrustDeclaredType` for container formats — which
+**substitutes** the declared type into the Accept check rather than waiving it. It was found to be
+a silent no-op (any bytes under any label passed a spec that set it); now
+`TestTrustDeclaredTypeStillChecksTheDeclaration` pins that the label is at least required to match.
 
 Two tests were passing for the wrong reason and only failed once the check became real — both sent
 the *string* `"MZ"` or `"not text at all"`, which is text, and were refused solely because the client
@@ -607,8 +659,9 @@ goroutine. All three POST routes draw on it, because they all queue onto that on
 A bucket rather than a window because a window has to be reset and the reset is the hole. The
 property that matters for a framework whose pages stay open all day: **elapsed time is not credit** —
 refill stops at the cap, so a session idle for a day is full, not owed a day's worth. Refill is lazy,
-so ten thousand idle sessions cost no goroutines. Defaults are 10/s with a burst of 40, sized under
-the 64-deep mailbox, since a bigger burst is one already blocking request goroutines.
+so ten thousand idle sessions cost no goroutines. Defaults are 10/s with a burst of 40 — sized
+against what a page actually does, and it is also what bounds the now-unbounded mailbox on the
+client-driven side.
 
 It bounds what one page can do — to your database, to a metered API, and through pub/sub to
 everyone else's session, since one `Publish` costs every subscriber a render. What it cannot bound
@@ -630,8 +683,12 @@ Three things about it are load-bearing:
   on the server. `ForwardedClientIP(hops)` is the answer, and it counts `X-Forwarded-For` **from the
   end**: a proxy appends, so the entries nearest the end are the trustworthy ones and everything
   before them is whatever the client sent. Reading the leftmost entry — the usual mistake — is not a
-  limiter at all, since the client then picks its own bucket. A wrong hop count degrades (too high
-  falls back to the connection, too low charges the proxy) and never opens.
+  limiter at all, since the client then picks its own bucket. **hops must be exact**: too low
+  charges the proxy, which degrades safely, but too high reads a position the client controls —
+  the header's total length is theirs too, so padding it puts their chosen value at that position
+  and the limiter opens. The chosen entry must at least parse as an address (arbitrary strings
+  never become bucket keys), but that confines forgery rather than preventing it. The earlier claim
+  here that a wrong count "never opens" was wrong in the too-high direction.
 - **IPv6 is charged per /64.** The smallest allocation anyone gets is a /64, so a limit keyed on the
   full address is a limit per attempt against eighteen quintillion keys. `narrow` passes through
   anything that is not an address, which is what lets `ClientIP` return an account id.
@@ -745,6 +802,14 @@ idempotent `Mount` a real constraint rather than advice.
 `Handler.Heartbeat` (default 25s) writes an empty signal patch on an idle stream. It keeps
 intermediaries from closing the connection, and a write is the only way this end learns the client
 has gone.
+
+**A second stream displaces the first rather than getting a 409.** The refusal needed liveness
+detection to be safe: a client that vanished without closing held the slot until a heartbeat write
+failed — up to a whole heartbeat, or *forever* with the heartbeat disabled, which bricked
+reconnection outright. The session id is a capability, so a second holder is almost always the same
+client's newer attempt; the newest wins, the displaced stream is cancelled, and its teardown does
+not start the eviction clock on a session someone else now holds (`streamSlot` tokens are what make
+that safe). `TestSecondStreamTakesOver` replaced the 409 test.
 
 **A stream also greets on connect** — the same empty patch, once, unconditionally. A client cannot
 tell a live stream from a stalled one until bytes arrive, and Datastar's retry is silent, so a page

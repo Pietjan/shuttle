@@ -183,10 +183,12 @@ func (b *Base) Path() string {
 	return b.n.sess.Path()
 }
 
-// Push re-renders this component and sends the result to the page. Safe to
-// call from any goroutine - that is the point of holding state on the
-// server. Actions do not need it: the transport pushes automatically once
-// a handler returns.
+// Push schedules this component's re-render, which the session's own
+// goroutine performs and sends to the page. Marking rather than rendering
+// is what makes it safe to call from any goroutine - that is the point of
+// holding state on the server - and what makes ten pushes in a row cost
+// one render. Actions do not need it: the transport pushes automatically
+// once a handler returns.
 //
 // Only this component's subtree is re-rendered and patched. A child pushing
 // itself does not disturb its parent.

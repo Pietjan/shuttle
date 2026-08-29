@@ -3,6 +3,7 @@ package shuttle
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -507,5 +508,25 @@ func TestShimUploadsWithXHR(t *testing.T) {
 		if !strings.Contains(page, want) {
 			t.Errorf("shim missing %q", want)
 		}
+	}
+}
+
+// TestTrustDeclaredTypeStillChecksTheDeclaration. The flag substitutes the
+// declared type for the detected one - it does not waive the check. It once
+// did, silently: any bytes under any label passed a spec that set it.
+func TestTrustDeclaredTypeStillChecksTheDeclaration(t *testing.T) {
+	const docx = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+	spec := Upload{Name: "doc", Accept: []string{docx}, TrustDeclaredType: true}
+
+	// A zip declared as docx: the bytes cannot settle it, the label may.
+	f, err := receive(strings.NewReader("PK\x03\x04 pretend zip"), "a.docx", docx, spec)
+	if err != nil {
+		t.Fatalf("declared-as-accepted was refused: %v", err)
+	}
+	discard([]*UploadedFile{f})
+
+	// The same bytes under a label the spec never accepted.
+	if _, err := receive(strings.NewReader(peHeader), "evil.bin", "application/x-msdownload", spec); !errors.Is(err, ErrFileType) {
+		t.Errorf("declared-as-unaccepted: err = %v, want ErrFileType", err)
 	}
 }

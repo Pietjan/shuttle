@@ -35,11 +35,22 @@ type node struct {
 	// the bytes.
 	gen       uint64
 	cur, prev map[string]Action
+	// curSent records whether gen's markup was actually handed to the
+	// client. Renders coalesce, so a generation minted while the stream was
+	// behind can be superseded before anyone saw it - and granting such a
+	// generation grace would push out the one the client is really holding.
+	// prev only ever holds the last generation that was sent.
+	curSent bool
 	// last is the markup of the last adopted render, the bytes the client
 	// holds. A re-render is tried against it under the same generation
 	// first: equal bytes mean nothing changed, so nothing needs pushing
 	// and no new generation needs minting.
 	last string
+
+	// closed marks a node whose teardown has run, so anything registering
+	// cleanup after that runs it immediately instead of appending to a list
+	// nobody will ever read again.
+	closed bool
 
 	// children are keyed by the caller's key; order fixes each key's path
 	// index so a child keeps its ids when its siblings come and go.
@@ -55,11 +66,20 @@ type node struct {
 	cleanup []func()
 }
 
-// onClose registers teardown to run when this component is unmounted.
+// onClose registers teardown to run when this component is unmounted. On a
+// node already unmounted - a Do closure subscribing after the component's
+// key stopped being rendered - the teardown runs immediately, because the
+// list it would join has already been drained and the subscription or timer
+// would otherwise outlive its component for the rest of the session.
 func (n *node) onClose(fn func()) {
 	n.mu.Lock()
-	defer n.mu.Unlock()
+	if n.closed {
+		n.mu.Unlock()
+		fn()
+		return
+	}
 	n.cleanup = append(n.cleanup, fn)
+	n.mu.Unlock()
 }
 
 func newNode(sess *Session, parent *node, p path, key string, cmp Component) *node {
@@ -129,7 +149,15 @@ func (n *node) render(ctx context.Context) (string, error) {
 	}
 
 	n.mu.Lock()
-	n.prev, n.cur = n.cur, sc.table
+	// Grace goes to the generation the client saw, not to the newest one
+	// minted. A cur that was never sent - superseded while the stream was
+	// behind - is discarded outright, and prev keeps covering whatever was
+	// last on the wire.
+	if n.curSent {
+		n.prev = n.cur
+	}
+	n.cur = sc.table
+	n.curSent = false
 	n.last = html
 	n.mu.Unlock()
 
@@ -238,7 +266,9 @@ func (n *node) writeRoot(buf *bytes.Buffer, sc *scope) error {
 	return nil
 }
 
-// push marks this component for re-render on the session's goroutine.
+// push marks this component for re-render on the session's goroutine. The
+// render itself happens there, after the current work item - push never
+// renders or sends anything on the caller's goroutine.
 //
 // Only this component's subtree: an event on a child must not re-render its
 // parent, which is the whole point of tracking dirtiness per component
@@ -248,6 +278,16 @@ func (n *node) writeRoot(buf *bytes.Buffer, sc *scope) error {
 // goroutine, and so that ten pushes in a row cost one render.
 func (n *node) push(context.Context) error {
 	return n.sess.markDirty(n)
+}
+
+// markSent records that this node's current markup reached the client -
+// via the stream, the page's first paint, or the testing kit. From here on
+// gen is a generation the client may click against, so the next new
+// generation moves its table to prev rather than discarding it.
+func (n *node) markSent() {
+	n.mu.Lock()
+	n.curSent = true
+	n.mu.Unlock()
 }
 
 // lookup finds a registered action, falling back to the previous render's
@@ -323,6 +363,12 @@ func (n *node) prune(ctx context.Context, seen map[string]bool) {
 		if !seen[key] {
 			gone = append(gone, c)
 			delete(n.children, key)
+			// The index too: it only existed to keep a mounted child's ids
+			// stable, and this child's state is gone with it. Keeping every
+			// index ever handed out would grow the map by one entry per key
+			// the parent has ever rendered - a feed mounting a child per
+			// item makes that the session's memory ceiling.
+			delete(n.order, key)
 		}
 	}
 	n.mu.Unlock()
@@ -335,11 +381,13 @@ func (n *node) prune(ctx context.Context, seen map[string]bool) {
 // close unmounts this component and everything below it.
 func (n *node) close(ctx context.Context) {
 	n.mu.Lock()
+	n.closed = true
 	children := make([]*node, 0, len(n.children))
 	for _, c := range n.children {
 		children = append(children, c)
 	}
 	n.children = map[string]*node{}
+	n.order = map[string]int{}
 	cleanup := n.cleanup
 	n.cleanup = nil
 	n.mu.Unlock()
@@ -356,7 +404,17 @@ func (n *node) close(ctx context.Context) {
 
 	n.sess.unregister(n)
 	if u, ok := n.cmp.(Unmounter); ok {
-		u.Unmount(ctx)
+		// Guarded like a render: session teardown runs a whole tree of
+		// these, and one panicking Unmount must not abort the rest or take
+		// the session's goroutine with it.
+		func() {
+			defer func() {
+				if v := recover(); v != nil {
+					n.sess.fail("unmount", fmt.Errorf("%w: Unmount: %v", ErrPanic, v))
+				}
+			}()
+			u.Unmount(ctx)
+		}()
 	}
 }
 

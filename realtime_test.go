@@ -106,7 +106,7 @@ func mountSession(t *testing.T, id string, cmp Component, broker Broker, pres *p
 	})
 	t.Cleanup(func() { sess.close(context.Background()) })
 
-	if err := sess.call(func() error {
+	if err := sess.call(context.Background(), func() error {
 		if m, ok := cmp.(Mounter); ok {
 			if err := m.Mount(context.Background(), nil); err != nil {
 				return err
@@ -240,7 +240,7 @@ func TestSubscribeNeedsAnInformer(t *testing.T) {
 func TestEveryTicksAndStops(t *testing.T) {
 	c := &clock{}
 	sess := newSession("test", c)
-	if err := sess.call(func() error {
+	if err := sess.call(context.Background(), func() error {
 		if err := c.Mount(context.Background(), nil); err != nil {
 			return err
 		}
@@ -310,7 +310,7 @@ func TestWorkIsSerialised(t *testing.T) {
 
 	for range 50 {
 		wg.Go(func() {
-			_ = sess.call(func() error {
+			_ = sess.call(context.Background(), func() error {
 				mu.Lock()
 				inside++
 				if inside > 1 {
@@ -404,7 +404,7 @@ func TestUnmountStopsATimer(t *testing.T) {
 	// Stop rendering its key: the child is unmounted. Both the field write
 	// and the render go through the session's goroutine, the way a handler
 	// does them - from here they race the timer this test is about.
-	if err := sess.call(func() error {
+	if err := sess.call(ctx, func() error {
 		l.Labels = nil
 		_, err := sess.Render(ctx)
 		return err
@@ -437,7 +437,7 @@ func TestUnmountStopsATimer(t *testing.T) {
 // item ahead of it has run.
 func settle(t *testing.T, sess *Session) {
 	t.Helper()
-	if err := sess.call(func() error { return nil }); err != nil {
+	if err := sess.call(context.Background(), func() error { return nil }); err != nil {
 		t.Fatalf("settling: %v", err)
 	}
 }
@@ -456,7 +456,7 @@ func TestUnmountStopsASubscription(t *testing.T) {
 	n, _ := sess.node("c-1")
 	child := n.cmp.(*ticker)
 
-	if err := sess.call(func() error {
+	if err := sess.call(ctx, func() error {
 		l.Labels = nil
 		_, err := sess.Render(ctx)
 		return err

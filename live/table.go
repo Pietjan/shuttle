@@ -49,8 +49,10 @@ type Column[T any] struct {
 	Key string
 	// Title is the header text.
 	Title string
-	// Cell renders one row's value for this column.
-	Cell func(row T) templ.Component
+	// Cell renders one row's value for this column. The context is the
+	// render's, so a cell can carry bindings of its own - a per-row button
+	// is shuttle.OnClick(ctx, ...) like anywhere else.
+	Cell func(ctx context.Context, row T) templ.Component
 	// Sortable allows the header to be clicked.
 	Sortable bool
 	// Width is a Tailwind width class for the column - "w-40", "w-1/4".
@@ -100,6 +102,13 @@ type Table[T any] struct {
 	// Empty is shown when nothing matches.
 	Empty string
 
+	// Param prefixes this table's URL keys - "u" turns q into u-q, sort
+	// into u-sort, and so on. Zero leaves the plain keys, which is right
+	// for the only table on a page. Two tables sharing one URL must each
+	// set their own, because the merged query string is otherwise a fight
+	// neither wins - and this field is the only way an app can avoid it.
+	Param string
+
 	page   Page[T]
 	query  Query
 	failed error
@@ -146,7 +155,7 @@ func (t *Table[T]) hiddenKeys() []string {
 }
 
 // toggleColumn shows or hides one column.
-func (t *Table[T]) toggleColumn(_ context.Context, key string) error {
+func (t *Table[T]) toggleColumn(ctx context.Context, key string) error {
 	if t.hidden == nil {
 		t.hidden = map[string]bool{}
 	}
@@ -160,6 +169,16 @@ func (t *Table[T]) toggleColumn(_ context.Context, key string) error {
 		return nil
 	}
 	t.hidden[key] = true
+
+	// Hiding the sorted column takes the only control that can un-sort it
+	// off the screen - the third click on its heading. The data must not
+	// stay ordered by an invisible key nobody can reach, so hiding it is
+	// the un-sort.
+	if t.query.Sort == key {
+		t.query.Sort, t.query.Desc = "", false
+		t.query.Offset = 0
+		return t.reload(ctx)
+	}
 	return nil
 }
 
@@ -183,26 +202,49 @@ func (t *Table[T]) debounce() time.Duration {
 	return DefaultDebounce
 }
 
+// param renders one of this table's URL keys, under Param's prefix if any.
+func (t *Table[T]) param(name string) string {
+	if t.Param == "" {
+		return name
+	}
+	return t.Param + "-" + name
+}
+
 // HandleParams reads the view out of the URL, so a shared link opens the
 // same table - and so a session lost to a restart comes back where it was.
 func (t *Table[T]) HandleParams(ctx context.Context, p shuttle.Params) error {
-	t.query.Filter = p.Get("q")
-	t.query.Sort = p.Get("sort")
-	t.query.Desc = p.Get("dir") == "desc"
+	wasFiltering := t.query.Filter
+	t.query.Filter = p.Get(t.param("q"))
+	t.query.Sort = p.Get(t.param("sort"))
+	t.query.Desc = p.Get(t.param("dir")) == "desc"
 
 	t.hidden = map[string]bool{}
-	for key := range strings.SplitSeq(p.Get("hide"), ",") {
+	for key := range strings.SplitSeq(p.Get(t.param("hide")), ",") {
 		if key != "" {
 			t.hidden[key] = true
 		}
 	}
+	// A URL hiding everything describes a table that cannot exist - Visible
+	// falls back to the first column, so the state has to follow it or the
+	// picker, the URL and the screen all disagree about that column.
+	if len(t.Visible()) > 0 && t.hidden[t.Visible()[0].Key] {
+		delete(t.hidden, t.Visible()[0].Key)
+	}
 
-	page, _ := strconv.Atoi(p.Get("page"))
+	page, _ := strconv.Atoi(p.Get(t.param("page")))
 	if page < 1 {
 		page = 1
 	}
 	t.query.Limit = t.limit()
 	t.query.Offset = (page - 1) * t.query.Limit
+
+	// The filter box is a client-side signal that renders deliberately
+	// cannot overwrite - which is right per keystroke and wrong here, where
+	// the URL is the authority: the back button restoring ?q= must reach
+	// the box, or it filters by one thing and shows another.
+	if t.query.Filter != wasFiltering {
+		_ = t.PatchSignal("filter", t.query.Filter)
+	}
 
 	return t.reload(ctx)
 }
@@ -211,21 +253,21 @@ func (t *Table[T]) HandleParams(ctx context.Context, p shuttle.Params) error {
 func (t *Table[T]) QueryParams() url.Values {
 	q := url.Values{}
 	if t.query.Filter != "" {
-		q.Set("q", t.query.Filter)
+		q.Set(t.param("q"), t.query.Filter)
 	}
 	if t.query.Sort != "" {
-		q.Set("sort", t.query.Sort)
+		q.Set(t.param("sort"), t.query.Sort)
 		if t.query.Desc {
-			q.Set("dir", "desc")
+			q.Set(t.param("dir"), "desc")
 		}
 	}
 	if n := t.pageNumber(); n > 1 {
-		q.Set("page", strconv.Itoa(n))
+		q.Set(t.param("page"), strconv.Itoa(n))
 	}
 	// Hidden rather than visible, so the common case - everything showing -
 	// leaves the URL alone.
 	if hidden := t.hiddenKeys(); len(hidden) > 0 {
-		q.Set("hide", strings.Join(hidden, ","))
+		q.Set(t.param("hide"), strings.Join(hidden, ","))
 	}
 	return q
 }
@@ -254,6 +296,22 @@ func (t *Table[T]) reload(ctx context.Context) error {
 		t.page, t.failed = Page[T]{}, err
 		return nil
 	}
+
+	// An offset past the end - ?page=99 in a shared link, a filter that
+	// shrank the set - snaps to the real last page rather than rendering
+	// "491-490 of 15" around an empty body.
+	if page.Total >= 0 && t.query.Offset > 0 && t.query.Offset >= page.Total {
+		last := 0
+		if page.Total > 0 {
+			last = (page.Total - 1) / t.query.Limit * t.query.Limit
+		}
+		t.query.Offset = last
+		if page, err = t.Load(ctx, t.query); err != nil {
+			t.page, t.failed = Page[T]{}, err
+			return nil
+		}
+	}
+
 	t.page = page
 	return nil
 }
@@ -323,7 +381,7 @@ func (t *Table[T]) Render(ctx context.Context) templ.Component {
 	for _, row := range t.page.Rows {
 		cells := make([]templ.Component, 0, len(visible))
 		for _, col := range visible {
-			cells = append(cells, with(table.Cell(), t.cell(col, row)))
+			cells = append(cells, with(table.Cell(), t.cell(ctx, col, row)))
 		}
 		body = append(body, with(table.Row(), cells...))
 	}
@@ -442,11 +500,11 @@ func (t *Table[T]) sortState(col Column[T]) string {
 	return "ascending"
 }
 
-func (t *Table[T]) cell(col Column[T], row T) templ.Component {
+func (t *Table[T]) cell(ctx context.Context, col Column[T], row T) templ.Component {
 	if col.Cell == nil {
 		return text("")
 	}
-	return col.Cell(row)
+	return col.Cell(ctx, row)
 }
 
 // emptyRow says why there is nothing, in a row spanning the table.
@@ -501,9 +559,10 @@ func (t *Table[T]) chooser(ctx context.Context) templ.Component {
 	}
 
 	items := make([]templ.Component, 0, len(t.Columns))
+	visible := len(t.Visible())
 	for _, col := range t.Columns {
 		key, shown := col.Key, !t.hidden[col.Key]
-		last := shown && len(t.Visible()) <= 1
+		last := shown && visible <= 1
 
 		options := []dropdown.Option{
 			dropdown.Attr("data-shuttle-column", key),
@@ -621,9 +680,9 @@ func (t *Table[T]) pageLink(
 func (t *Table[T]) href(page int) string {
 	q := t.QueryParams()
 	if page > 1 {
-		q.Set("page", strconv.Itoa(page))
+		q.Set(t.param("page"), strconv.Itoa(page))
 	} else {
-		q.Del("page")
+		q.Del(t.param("page"))
 	}
 	if len(q) == 0 {
 		return "?"
@@ -687,6 +746,11 @@ func (t *Table[T]) count() string {
 	}
 	if t.page.Total == 0 {
 		return "No rows"
+	}
+	// A page with no rows against a positive total is a view past the end
+	// that reload could not snap back - say so rather than counting it.
+	if len(t.page.Rows) == 0 {
+		return "0 of " + strconv.Itoa(t.page.Total)
 	}
 
 	from := t.query.Offset + 1

@@ -63,15 +63,15 @@ func table() shuttle.Component {
 		Columns: []live.Column[person]{
 			{
 				Key: "name", Title: "Name", Sortable: true, Width: "w-52",
-				Cell: func(p person) templ.Component { return live.Text(p.Name) },
+				Cell: func(_ context.Context, p person) templ.Component { return live.Text(p.Name) },
 			},
 			{
 				Key: "role", Title: "Role", Sortable: true, Width: "w-36",
-				Cell: func(p person) templ.Component { return live.Text(p.Role) },
+				Cell: func(_ context.Context, p person) templ.Component { return live.Text(p.Role) },
 			},
 			{
 				Key: "team", Title: "Team", Width: "w-28",
-				Cell: func(p person) templ.Component { return live.Text(p.Team) },
+				Cell: func(_ context.Context, p person) templ.Component { return live.Text(p.Team) },
 			},
 		},
 		Load:       load,

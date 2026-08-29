@@ -171,9 +171,16 @@ func narrow(s string) string {
 //
 // The connection's own address is not in the header, so hops-1 entries at
 // the end were written by proxies, and the one before them is the client.
-// Getting hops wrong degrades rather than opens: too high falls back to the
-// connection's address, too low charges the proxy, and neither lets a
-// client choose its own bucket.
+//
+// hops must be exact, and that is a real requirement rather than tuning
+// advice. Too low charges the proxy, which degrades safely. Too high does
+// not: the position it reads then lies in the client-written part of the
+// header, and the header's total length is also client-controlled - so a
+// client that pads it puts whatever it likes at that position and picks its
+// own bucket per request, which is no limiter at all. The chosen entry is
+// at least required to parse as an address, so the keys a forger mints are
+// confined to address shape, but confinement is not a fix: count your
+// proxies.
 //
 // A handler that is not behind a proxy must not use this - use the default,
 // which reads the connection.
@@ -194,7 +201,13 @@ func ForwardedClientIP(hops int) func(*http.Request) string {
 			}
 		}
 		if i := len(chain) - hops; i >= 0 {
-			return chain[i]
+			// A proxy writes addresses. An entry that is not one was written
+			// by the client - a misconfigured hop count is reading the wrong
+			// part of the header, and arbitrary strings must not become
+			// bucket keys.
+			if _, err := netip.ParseAddr(chain[i]); err == nil {
+				return chain[i]
+			}
 		}
 		return remoteIP(r)
 	}

@@ -123,7 +123,8 @@ func (f *Feed[T]) Reset(ctx context.Context) error {
 	if err := f.reload(ctx); err != nil {
 		return err
 	}
-	return f.stream(ctx, f.first.Rows, 0)
+	_, err := f.stream(ctx, f.first.Rows, 0)
+	return err
 }
 
 // reload fetches the first page into the component's own state.
@@ -162,10 +163,23 @@ func (f *Feed[T]) more(ctx context.Context) error {
 		return nil
 	}
 
-	if err := f.stream(ctx, page.Rows, f.sent); err != nil {
+	if f.sent == 0 {
+		// This is the first page arriving late - a retry after Mount's own
+		// load failed. It has to land in first as well as the stream, or a
+		// fresh full render (a reconnect outside the grace window) would
+		// show an empty feed over a healthy source, and Held would report a
+		// page this component is in fact holding as zero.
+		f.first = page
+	}
+
+	appended, err := f.stream(ctx, page.Rows, f.sent)
+	// Advanced by what actually reached the container, not by the page: a
+	// stream that failed partway must not count rows the client never got,
+	// or the retry would re-append the ones it did under the same ids.
+	f.sent += appended
+	if err != nil {
 		return err
 	}
-	f.sent += len(page.Rows)
 	f.done = f.exhausted(page)
 	return nil
 }
@@ -185,18 +199,20 @@ func (f *Feed[T]) retry(ctx context.Context) error {
 	return f.more(ctx)
 }
 
-// stream appends rows to the container, numbered from at.
-func (f *Feed[T]) stream(ctx context.Context, rows []T, at int) error {
+// stream appends rows to the container, numbered from at. It returns how
+// many were appended before any failure, so the caller's cursor can follow
+// what the client actually has.
+func (f *Feed[T]) stream(ctx context.Context, rows []T, at int) (int, error) {
 	s := f.Stream(feedStream)
 	if s == nil {
-		return shuttle.ErrNotMounted
+		return 0, shuttle.ErrNotMounted
 	}
 	for i, row := range rows {
 		if err := s.Append(ctx, key(at+i), f.row(at+i, row)); err != nil {
-			return err
+			return i, err
 		}
 	}
-	return nil
+	return len(rows), nil
 }
 
 // fetch asks the source for the page starting at offset.
@@ -217,6 +233,14 @@ func (f *Feed[T]) fetch(ctx context.Context, offset int) (Page[T], error) {
 // the price of not knowing, and it is cheaper than making every source
 // count.
 func (f *Feed[T]) exhausted(page Page[T]) bool {
+	// An empty page is final whatever Total claims. Totals overstate for
+	// mundane reasons - rows deleted between pages, a cached count, a query
+	// filtered after counting - and trusting one past an empty answer is a
+	// sentinel re-armed against a source with nothing left: a request loop
+	// bounded only by the session's budget.
+	if len(page.Rows) == 0 {
+		return true
+	}
 	if page.Total >= 0 {
 		return f.sent >= page.Total
 	}
@@ -254,6 +278,11 @@ func (f *Feed[T]) row(i int, r T) templ.Component {
 
 func (f *Feed[T]) Render(ctx context.Context) templ.Component {
 	s := f.Stream(feedStream)
+	if s == nil {
+		// Not mounted: rendering would dereference a stream that does not
+		// exist. The guard the other stream users already have.
+		return empty
+	}
 
 	items := make([]templ.Component, 0, len(f.first.Rows))
 	for i, row := range f.first.Rows {
@@ -308,7 +337,15 @@ func (f *Feed[T]) footer(ctx context.Context) templ.Component {
 func (f *Feed[T]) sentinel(ctx context.Context) templ.Component {
 	return skeleton.New(
 		skeleton.ID(shuttle.ElementID(ctx, "sentinel")),
-		skeleton.Attr("data-shuttle-sentinel", ""),
+		// The offset the next firing will ask for - and the reason the
+		// sentinel keeps firing at all. Datastar re-applies a plugin when
+		// its attribute value changes, and the observer's re-application is
+		// what delivers the initial "still on screen" callback that walks a
+		// short first page forward. Since generations are only minted when
+		// markup changes, a feed whose own markup did not move would keep
+		// its action id byte-for-byte and never re-arm; this attribute moves
+		// with every page, so the render after each load always differs.
+		skeleton.Attr("data-shuttle-sentinel", strconv.Itoa(f.sent)),
 		skeleton.Attr("style", "min-height:2.5rem"),
 		skeleton.Class("h-10"),
 		shuttle.OnIntersect(ctx, skeleton.Attr, f.more),

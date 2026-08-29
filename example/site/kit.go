@@ -152,27 +152,27 @@ func newTable() shuttle.Component {
 		Columns: []live.Column[person]{
 			{
 				Key: "name", Title: "Name", Sortable: true, Width: "w-52",
-				Cell: func(p person) templ.Component { return live.Text(p.Name) },
+				Cell: func(_ context.Context, p person) templ.Component { return live.Text(p.Name) },
 			},
 			{
 				Key: "role", Title: "Role", Sortable: true, Width: "w-36",
-				Cell: func(p person) templ.Component { return live.Text(p.Role) },
+				Cell: func(_ context.Context, p person) templ.Component { return live.Text(p.Role) },
 			},
 			{
 				// Not sortable, and not for want of a key: a badge column is
 				// a status, and sorting by colour is nobody's intent.
 				Key: "team", Title: "Team", Width: "w-28",
-				Cell: func(p person) templ.Component {
+				Cell: func(_ context.Context, p person) templ.Component {
 					return inside(badge.New(teamTone(p.Team), badge.Small), label(p.Team))
 				},
 			},
 			{
 				Key: "place", Title: "Location", Sortable: true, Width: "w-40",
-				Cell: func(p person) templ.Component { return live.Text(p.Place) },
+				Cell: func(_ context.Context, p person) templ.Component { return live.Text(p.Place) },
 			},
 			{
 				Key: "joined", Title: "Joined", Sortable: true, Width: "w-32",
-				Cell: func(p person) templ.Component { return live.Text(p.Joined) },
+				Cell: func(_ context.Context, p person) templ.Component { return live.Text(p.Joined) },
 			},
 		},
 		Load:       loadDirectory,
