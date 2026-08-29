@@ -1,0 +1,49 @@
+package main
+
+import (
+	"fmt"
+
+	"github.com/pietjan/loom/button"
+	"github.com/pietjan/loom/checkbox"
+	"github.com/pietjan/loom/input"
+	"github.com/pietjan/shuttle"
+)
+
+// page is the whole UI. templ's implicit ctx is the render context shuttle
+// hands to Render, so the bindings work here exactly as they do in
+// Go-assembled markup - and ids follow the same rule: everything that must
+// survive a morph gets a stable, named id.
+templ (t *Todos) page() {
+	<h1>Todos</h1>
+	@input.New(
+		shuttle.ID(ctx, input.ID, "draft"),
+		shuttle.Bind(ctx, input.Attr, "draft"),
+		// value= renders committed state, and a draft is committed by add,
+		// never by typing - so it is always empty, and the morph never
+		// overwrites what is being typed.
+		input.Value(""),
+		input.Placeholder("What needs doing?"),
+	)
+	@button.New(button.Primary, shuttle.OnClick(ctx, button.Attr, t.add)) {
+		Add
+	}
+	<ul>
+		for _, item := range t.Items {
+			<li id={ shuttle.ElementID(ctx, fmt.Sprintf("item-%d", item.ID)) }>
+				@checkbox.New(
+					shuttle.ID(ctx, checkbox.ID, fmt.Sprintf("done-%d", item.ID)),
+					checkedIf(item.Done),
+					shuttle.OnClick(ctx, checkbox.Attr, t.toggle(item.ID)),
+				)
+				if item.Done {
+					<s>{ item.Text }</s>
+				} else {
+					{ item.Text }
+				}
+				@button.New(button.Ghost, button.Small, shuttle.OnClick(ctx, button.Attr, t.remove(item.ID))) {
+					Remove
+				}
+			</li>
+		}
+	</ul>
+}

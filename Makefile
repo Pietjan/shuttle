@@ -118,6 +118,14 @@ tidy:
 	go tool $(tools) modernize -test -fix ./...
 	go tool $(tools) gofumpt -l -w .
 
+## generate: regenerate Go code from .templ files
+# The generated *_templ.go files are checked in, against the usual advice:
+# the examples are part of the published module, so they must build for
+# anyone who `go get`s it - and for CI - without the templ CLI.
+.PHONY: generate
+generate:
+	go tool $(tools) templ generate -path ./example/templ
+
 ## site/css: compile the examples site's stylesheet
 # cmd/css writes loom.css - Tailwind, loom's theme and its structural CSS,
 # with an @source pointing at the loom this module's replace directive
@@ -151,6 +159,11 @@ run/plain:
 .PHONY: run/counter
 run/counter:
 	go run ./example/counter
+
+## run/templ: run the .templ-authored example
+.PHONY: run/templ
+run/templ:
+	go run ./example/templ
 
 # ==================================================================================== #
 # OPERATIONS

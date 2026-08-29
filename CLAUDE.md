@@ -961,7 +961,17 @@ stray GET (`/favicon.ico` was doing it), and each costs a component tree.
 ## Examples
 
 `example/counter` is deliberately minimal — one component, one action, no configuration — and is
-what the README's first snippet shows. `example/site` is the examples site: one focused example per
+what the README's first snippet shows. `example/templ` is the same shape authored the way an app
+will actually write it: markup in a `.templ` file, state and actions in Go — it exists because
+every other example assembles markup programmatically, which is the one-file-per-example
+constraint, not the recommended style. templ's implicit `ctx` is the render context, so bindings
+work in a template unmodified. Its generated `*_templ.go` is **checked in**, deviating from Loom's
+site on purpose: the examples are inside the published module, so they must build for `go get` and
+CI without the templ CLI (the templ CLI is pinned in `tools/go.mod`; `make generate` regenerates).
+Its kit test drives the template through Click on the ids `shuttle.ID`/`ElementID` assign, which
+is also why the checkbox toggle binds `OnClick` rather than `change` — click is what a browser
+fires on a checkbox anyway, and the kit has no way to fire a bare `change`. `example/site` is the
+examples site: one focused example per
 feature, each its own `shuttle.Handler` mounted under `/e/<slug>/`, which also exercises
 `Handler.Prefix` for real.
 

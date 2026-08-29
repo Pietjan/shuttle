@@ -52,6 +52,17 @@ That is the whole of `example/counter`:
 go run ./example/counter
 ```
 
+The counter assembles its markup in Go, which suits a one-file example. An application will
+usually author templates instead, and `example/templ` is the same shape written that way: the
+component's state and actions are ordinary Go, and its markup is a `.templ` file with Loom
+components and shuttle bindings inline — templ's implicit `ctx` is the render context the
+bindings need, so `@button.New(button.Primary, shuttle.OnClick(ctx, button.Attr, t.add))` works
+in a template exactly as it does in Go:
+
+```bash
+go run ./example/templ
+```
+
 Everything else — forms, nesting, pub/sub and presence, streams, uploads, navigation, and the live
 component kit — has a focused example with its source alongside it:
 
