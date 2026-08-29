@@ -3,7 +3,7 @@
 // imports it and it ships no code.
 module github.com/pietjan/shuttle/tools
 
-go 1.26.5
+go 1.27.0
 
 tool (
 	github.com/golangci/golangci-lint/v2/cmd/golangci-lint

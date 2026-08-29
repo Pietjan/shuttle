@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/a-h/templ"
@@ -87,36 +88,38 @@ func (s *slowpoke) Render(context.Context) templ.Component {
 // it. The old shape ran Unmount on the caller's goroutine, racing an action
 // mid-execution, which is the one thing no component is written to survive.
 func TestCloseWaitsForTheWorkInFlight(t *testing.T) {
-	s := &slowpoke{release: make(chan struct{})}
-	sess := newSession("test", s)
+	synctest.Test(t, func(t *testing.T) {
+		s := &slowpoke{release: make(chan struct{})}
+		sess := newSession("test", s)
 
-	started := make(chan struct{})
-	if err := sess.submit(func() {
-		close(started)
-		<-s.release
-		// Unmount must not have run while this action held the goroutine.
-		if s.closed.Load() {
-			t.Error("unmounted while an action was still running")
+		started := make(chan struct{})
+		if err := sess.submit(func() {
+			close(started)
+			<-s.release
+			// Unmount must not have run while this action held the goroutine.
+			if s.closed.Load() {
+				t.Error("unmounted while an action was still running")
+			}
+			s.finished.Store(true)
+		}); err != nil {
+			t.Fatalf("submit: %v", err)
 		}
-		s.finished.Store(true)
-	}); err != nil {
-		t.Fatalf("submit: %v", err)
-	}
-	<-started
+		<-started
 
-	go func() {
-		// Let close arrive first, then release the action it must wait for.
-		time.Sleep(20 * time.Millisecond)
-		close(s.release)
-	}()
+		go func() {
+			// Let close arrive first, then release the action it must wait for.
+			time.Sleep(20 * time.Millisecond)
+			close(s.release)
+		}()
 
-	sess.close(context.Background())
-	if !s.finished.Load() {
-		t.Error("close returned before the in-flight action finished")
-	}
-	if !s.closed.Load() {
-		t.Error("close returned before Unmount ran")
-	}
+		sess.close(context.Background())
+		if !s.finished.Load() {
+			t.Error("close returned before the in-flight action finished")
+		}
+		if !s.closed.Load() {
+			t.Error("close returned before Unmount ran")
+		}
+	})
 }
 
 // TestGraceFollowsDeliveryNotMinting: renders coalesce, so generations can
@@ -220,7 +223,7 @@ func TestTwoJoinersOnOnePageLeaveOnce(t *testing.T) {
 func TestShutdownEndsEverySession(t *testing.T) {
 	h := New(func() Component { return &counter{} })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	_, sid := getPage(t, srv)

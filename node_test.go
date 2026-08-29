@@ -220,7 +220,7 @@ func TestChildActionRerendersOnlyTheChild(t *testing.T) {
 	l := &list{Labels: []string{"a", "b"}}
 	h := New(func() Component { return l })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, sid := getPage(t, srv)
@@ -255,7 +255,7 @@ func TestParentActionRedrawsItsChildren(t *testing.T) {
 	l := &list{Labels: []string{"a"}}
 	h := New(func() Component { return l })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, sid := getPage(t, srv)
@@ -285,7 +285,7 @@ func TestEmitReachesTheNearestReceiver(t *testing.T) {
 	l := &list{Labels: []string{"a", "b"}}
 	h := New(func() Component { return l })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, sid := getPage(t, srv)
@@ -410,7 +410,7 @@ func TestChildRendersStandaloneAsItDidInThePage(t *testing.T) {
 func TestChildrenSeeTheURL(t *testing.T) {
 	h := New(func() Component { return &urlParent{} })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	resp, err := srv.Client().Get(srv.URL + "/?filter=open")

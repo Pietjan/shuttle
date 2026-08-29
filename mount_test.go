@@ -26,7 +26,7 @@ func TestMountedUnderAPrefix(t *testing.T) {
 		io.WriteString(w, "the app's own home page")
 	})
 
-	srv := httptest.NewServer(app)
+	srv := httptest.NewTestServer(t, app)
 	t.Cleanup(srv.Close)
 
 	// The app's own routes are untouched.
@@ -82,7 +82,7 @@ func TestPrefixDoesNotSwallowSiblingRoutes(t *testing.T) {
 	h := New(func() Component { return &counter{} })
 	h.Logger = quietLogger()
 	h.Prefix = "/live"
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	for _, p := range []string{"/", "/other", "/live/deeper"} {
@@ -114,7 +114,7 @@ func TestCustomShellOwnsTheDocument(t *testing.T) {
 			p.Title, p.ScriptURL, p.Attach, p.Body)
 		return err
 	}
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, _ := getPage(t, srv)
@@ -143,7 +143,7 @@ func TestShellGetsWhatItNeeds(t *testing.T) {
 		got = p
 		return DefaultShell(w, p)
 	}
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	getPage(t, srv)
@@ -200,7 +200,7 @@ func TestSubtreeServesEveryPathUnderTheMount(t *testing.T) {
 
 	app := http.NewServeMux()
 	app.Handle("/e/", h)
-	srv := httptest.NewServer(app)
+	srv := httptest.NewTestServer(t, app)
 	t.Cleanup(srv.Close)
 
 	for _, path := range []string{"/e/", "/e/counter/", "/e/deep/nested/page"} {
@@ -228,7 +228,7 @@ func TestSubtreeServesEveryPathUnderTheMount(t *testing.T) {
 func TestSubtreeIsOptIn(t *testing.T) {
 	h := New(func() Component { return &pathAware{} })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	resp, err := srv.Client().Get(srv.URL + "/anything")

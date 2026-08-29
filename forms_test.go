@@ -240,7 +240,7 @@ func TestFormRoundTrip(t *testing.T) {
 	c := &signup{}
 	h := New(func() Component { return c })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, sid := getPage(t, srv)

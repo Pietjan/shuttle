@@ -17,7 +17,7 @@ func TestPageBudgetRefusesAFlood(t *testing.T) {
 	// Small and slow, so the test neither sleeps nor guesses.
 	h.PageRate = 1
 	h.PageBurst = 3
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	for i := range 3 {
@@ -44,7 +44,7 @@ func TestARefusedPageMintsNoSession(t *testing.T) {
 	h.Logger = quietLogger()
 	h.PageRate = 1
 	h.PageBurst = 1
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	if code := getStatus(t, srv, nil); code != http.StatusOK {
@@ -74,7 +74,7 @@ func TestPageBudgetIsPerClient(t *testing.T) {
 	// be named some other way. This is also the hook an app behind a proxy
 	// sets, so exercising it here is not only a convenience.
 	h.ClientIP = func(r *http.Request) string { return r.Header.Get("X-Test-Client") }
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	noisy := http.Header{"X-Test-Client": []string{"noisy"}}
@@ -99,7 +99,7 @@ func TestPageBudgetCanBeTurnedOff(t *testing.T) {
 	h := New(func() Component { return &counter{} })
 	h.Logger = quietLogger()
 	h.PageRate = -1
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	for i := range 30 {
@@ -115,7 +115,7 @@ func TestPageBudgetCanBeTurnedOff(t *testing.T) {
 func TestTheDefaultBudgetPassesOrdinaryUse(t *testing.T) {
 	h := New(func() Component { return &counter{} })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	for i := range int(DefaultPageBurst) {
@@ -318,6 +318,9 @@ func TestAForgottenClientIsWhereItWouldHaveBeen(t *testing.T) {
 // getResponse loads the page and keeps the response, for the headers.
 func getResponse(t *testing.T, srv *httptest.Server, header http.Header) *http.Response {
 	t.Helper()
+	// Client first: an in-memory test server only materialises URL on its
+	// first Client call, and the request below reads it.
+	client := srv.Client()
 	req, err := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -327,7 +330,7 @@ func getResponse(t *testing.T, srv *httptest.Server, header http.Header) *http.R
 			req.Header.Add(k, v)
 		}
 	}
-	resp, err := srv.Client().Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("GET page: %v", err)
 	}

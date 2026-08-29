@@ -96,7 +96,7 @@ func TestBudgetRefusesAFlood(t *testing.T) {
 	// Small and slow, so the test neither sleeps nor guesses.
 	h.RequestRate = 1
 	h.RequestBurst = 3
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	_, sid := getPage(t, srv)
@@ -134,7 +134,7 @@ func TestARefusedRequestNeverReachesTheComponent(t *testing.T) {
 	h.Logger = quietLogger()
 	h.RequestRate = 1
 	h.RequestBurst = 1
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, sid := getPage(t, srv)
@@ -165,7 +165,7 @@ func TestBudgetIsPerSession(t *testing.T) {
 	h.Logger = quietLogger()
 	h.RequestRate = 1
 	h.RequestBurst = 2
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	noisy, noisySid := getPage(t, srv)
@@ -190,7 +190,7 @@ func TestBudgetCanBeTurnedOff(t *testing.T) {
 	h := New(func() Component { return &counter{} })
 	h.Logger = quietLogger()
 	h.RequestRate = -1
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	_, sid := getPage(t, srv)
@@ -211,7 +211,7 @@ func TestEveryChangingRouteIsBudgeted(t *testing.T) {
 	h.Logger = quietLogger()
 	h.RequestRate = 1
 	h.RequestBurst = 1
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	for name, path := range map[string]string{
@@ -234,12 +234,15 @@ func TestEveryChangingRouteIsBudgeted(t *testing.T) {
 // postResponse is post with the response kept, for the headers.
 func postResponse(t *testing.T, srv *httptest.Server, sid, path string) *http.Response {
 	t.Helper()
+	// Client first: an in-memory test server only materialises URL on its
+	// first Client call, and the request below reads it.
+	client := srv.Client()
 	req, err := http.NewRequest(http.MethodPost, srv.URL+path, strings.NewReader(""))
 	if err != nil {
 		t.Fatal(err)
 	}
 	req.Header.Set(SessionHeader, sid)
-	resp, err := srv.Client().Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("post: %v", err)
 	}

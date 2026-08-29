@@ -47,6 +47,18 @@ type Live struct {
 //	live := shuttle.Test(t, &Counter{})
 //	live.Click("button")
 //	live.Assert().Text("#count", "1")
+//
+// For a component driven by [Base.Every], wrap the test in
+// [testing/synctest.Test]: the session's goroutine and its timers all live
+// in the bubble, so time.Sleep advances the fake clock and tick counts are
+// exact instead of raced against the wall clock.
+//
+//	synctest.Test(t, func(t *testing.T) {
+//	    live := shuttle.Test(t, &Clock{})
+//	    time.Sleep(3 * time.Second)
+//	    synctest.Wait()
+//	    live.Assert().Text("#ticks", "3")
+//	})
 func Test(tb TB, cmp Component) *Live {
 	tb.Helper()
 

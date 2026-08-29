@@ -291,7 +291,7 @@ func TestSignalValuesReachTheAction(t *testing.T) {
 	c := &search{}
 	h := New(func() Component { return c })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, sid := getPage(t, srv)
@@ -318,7 +318,7 @@ func TestActionSeesOnlyItsOwnNamespace(t *testing.T) {
 	c := &search{}
 	h := New(func() Component { return c })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, sid := getPage(t, srv)
@@ -360,7 +360,7 @@ func TestChildActionReadsItsOwnNamespace(t *testing.T) {
 	c := &search{}
 	h := New(func() Component { return &host{child: c} })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, sid := getPage(t, srv)
@@ -392,7 +392,7 @@ func TestPayloadsThatDoNotReachTheComponent(t *testing.T) {
 			c := &search{}
 			h := New(func() Component { return &host{child: c} })
 			h.Logger = quietLogger()
-			srv := httptest.NewServer(h)
+			srv := httptest.NewTestServer(t, h)
 			t.Cleanup(srv.Close)
 
 			page, sid := getPage(t, srv)
@@ -416,7 +416,7 @@ func TestPayloadsThatDoNotReachTheComponent(t *testing.T) {
 func TestActionWithoutSignalsIsFine(t *testing.T) {
 	h := New(func() Component { return &counter{} })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, sid := getPage(t, srv)
@@ -430,7 +430,7 @@ func TestActionWithoutSignalsIsFine(t *testing.T) {
 func TestStrayGETDoesNotStartASession(t *testing.T) {
 	h := New(func() Component { return &counter{} })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	for _, p := range []string{"/favicon.ico", "/robots.txt", "/anything/else"} {
@@ -472,7 +472,7 @@ func TestDebugWarnsAboutDuplicateIDs(t *testing.T) {
 	h := New(func() Component { return &dupes{} })
 	h.Logger = slog.New(slog.NewTextHandler(&log, nil))
 	h.Debug = true
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	getPage(t, srv)
@@ -489,7 +489,7 @@ func TestDebugWarnsAboutDuplicateIDs(t *testing.T) {
 func TestBadSignalPayloadIsARequestError(t *testing.T) {
 	h := New(func() Component { return &search{} })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, sid := getPage(t, srv)

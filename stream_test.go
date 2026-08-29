@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/a-h/templ"
@@ -275,7 +276,7 @@ func TestStreamIDsAreScopedToTheComponent(t *testing.T) {
 func TestStreamOverTheTransport(t *testing.T) {
 	h := New(func() Component { return &feed{} })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, sid := getPage(t, srv)
@@ -322,60 +323,62 @@ func TestStreamOverTheTransport(t *testing.T) {
 // Stream operations need their own check because they never go through the
 // dirty set, so guarding renders alone does not cover them.
 func TestUnmountedComponentStreamsNothing(t *testing.T) {
-	p := &switcher{Shown: "ticker"}
-	sess := newSession("test", p)
-	t.Cleanup(func() { sess.close(context.Background()) })
-	ctx := context.Background()
+	synctest.Test(t, func(t *testing.T) {
+		p := &switcher{Shown: "ticker"}
+		sess := newSession("test", p)
+		t.Cleanup(func() { sess.close(context.Background()) })
+		ctx := context.Background()
 
-	// Switching and rendering go through the session's goroutine, the way a
-	// handler does both. From here they race the timer: a tick can pass
-	// Stream.send's mounted check just as this goroutine unmounts the
-	// component underneath it, and enqueue against a node that has left the
-	// page - the very straggler being tested for, arriving by a route no
-	// page can take.
-	show := func(round int, what string) {
-		t.Helper()
-		if err := sess.call(ctx, func() error {
-			p.Shown = what
-			_, err := sess.Render(ctx)
-			return err
-		}); err != nil {
-			t.Fatalf("round %d: rendering %q: %v", round, what, err)
+		// Switching and rendering go through the session's goroutine, the way a
+		// handler does both. From here they race the timer: a tick can pass
+		// Stream.send's mounted check just as this goroutine unmounts the
+		// component underneath it, and enqueue against a node that has left the
+		// page - the very straggler being tested for, arriving by a route no
+		// page can take.
+		show := func(round int, what string) {
+			t.Helper()
+			if err := sess.call(ctx, func() error {
+				p.Shown = what
+				_, err := sess.Render(ctx)
+				return err
+			}); err != nil {
+				t.Fatalf("round %d: rendering %q: %v", round, what, err)
+			}
 		}
-	}
 
-	// Show it, let it stream, then switch away - twice, because coming back
-	// to a component mounts a second instance under the same key, and the
-	// second unmount is where a leak would show.
-	for round := range 2 {
-		show(round, "ticker")
-		waitFor(t, time.Second, func() bool {
-			return len(sess.take()) > 0
-		}, "the stream to produce something")
+		// Show it, let it stream, then switch away - twice, because coming back
+		// to a component mounts a second instance under the same key, and the
+		// second unmount is where a leak would show.
+		for round := range 2 {
+			show(round, "ticker")
+			waitFor(t, time.Second, func() bool {
+				return len(sess.take()) > 0
+			}, "the stream to produce something")
 
-		show(round, "quiet")
-		// Drain what the component produced while it was mounted, including
-		// anything queued ahead of the unmount: the mailbox is
-		// first-in-first-out, so settling first means those have all landed
-		// and this take clears them.
-		settle(t, sess)
-		sess.take()
+			show(round, "quiet")
+			// Drain what the component produced while it was mounted, including
+			// anything queued ahead of the unmount: the mailbox is
+			// first-in-first-out, so settling first means those have all landed
+			// and this take clears them.
+			settle(t, sess)
+			sess.take()
 
-		// Then wait, and that wait is the test rather than a hedge. Both
-		// things being checked - the timer stopping at unmount, and
-		// Stream.send refusing an unmounted node - are mechanisms that fail
-		// by *doing* something, and a tick needs wall-clock time to do it.
-		// Settling alone passes in microseconds, which is to say it passes
-		// whether or not either guard is there. Eight intervals is enough
-		// for a live ticker to give itself away.
-		time.Sleep(80 * time.Millisecond)
+			// Then wait, and that wait is the test rather than a hedge. Both
+			// things being checked - the timer stopping at unmount, and
+			// Stream.send refusing an unmounted node - are mechanisms that fail
+			// by *doing* something, and a tick needs wall-clock time to do it.
+			// Settling alone passes in microseconds, which is to say it passes
+			// whether or not either guard is there. Eight intervals is enough
+			// for a live ticker to give itself away.
+			time.Sleep(80 * time.Millisecond)
 
-		settle(t, sess)
-		if got := sess.take(); len(got) > 0 {
-			t.Errorf("round %d: %d patches after unmount, first targeting %q",
-				round, len(got), got[0].target)
+			settle(t, sess)
+			if got := sess.take(); len(got) > 0 {
+				t.Errorf("round %d: %d patches after unmount, first targeting %q",
+					round, len(got), got[0].target)
+			}
 		}
-	}
+	})
 }
 
 // switcher renders exactly one child, and which one changes - the shape of

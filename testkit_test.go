@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/a-h/templ"
 
@@ -575,4 +577,25 @@ func TestSelectorCompoundsClassesAndQuotedValues(t *testing.T) {
 	if len(got) != 1 {
 		t.Errorf(`[title="hello world"] matched %d, want 1 - the space must not split the step`, len(got))
 	}
+}
+
+// TestTheKitRunsUnderSynctest: a component driven by Every was untestable
+// without wall-clock sleeps, because nothing could advance time. Wrapping
+// a kit test in synctest.Test fixes that - the session's goroutine, its
+// timers and the kit all live in the bubble, so time.Sleep advances the
+// fake clock and the ticks are exact rather than raced.
+func TestTheKitRunsUnderSynctest(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := &clock{}
+		live := Test(t, c)
+
+		// Ten intervals pass instantly and deterministically.
+		time.Sleep(52 * time.Millisecond)
+		synctest.Wait()
+
+		if got := c.count(); got != 10 {
+			t.Errorf("ticks = %d, want exactly 10 - fake time does not race", got)
+		}
+		live.Assert().Exists("#ticks")
+	})
 }

@@ -15,7 +15,7 @@ import (
 func TestShimReportsConnectionState(t *testing.T) {
 	h := New(func() Component { return &counter{} })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, _ := getPage(t, srv)
@@ -42,7 +42,7 @@ func TestShimReportsConnectionState(t *testing.T) {
 func TestHealthEndpointCostsNothing(t *testing.T) {
 	h := New(func() Component { return &counter{} })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	for range 5 {
@@ -73,7 +73,7 @@ func TestHeartbeatKeepsTheStreamWriting(t *testing.T) {
 	h := New(func() Component { return &counter{} })
 	h.Logger = quietLogger()
 	h.Heartbeat = 20 * time.Millisecond
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	_, sid := getPage(t, srv)
@@ -101,7 +101,7 @@ func TestHeartbeatCanBeTurnedOff(t *testing.T) {
 	h := New(func() Component { return &counter{} })
 	h.Logger = quietLogger()
 	h.Heartbeat = -1
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	_, sid := getPage(t, srv)
@@ -136,7 +136,7 @@ func TestShimIsInPageScripts(t *testing.T) {
 		got = p
 		return DefaultShell(w, p)
 	}
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	getPage(t, srv)
@@ -161,7 +161,7 @@ func TestStreamGreetsOnConnect(t *testing.T) {
 	h := New(func() Component { return &counter{} })
 	h.Logger = quietLogger()
 	h.Heartbeat = -1
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	_, sid := getPage(t, srv)

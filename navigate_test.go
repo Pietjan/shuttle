@@ -86,7 +86,7 @@ func TestHandleParamsRunsOnFirstRender(t *testing.T) {
 	c := &table{}
 	h := New(func() Component { return c })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	resp, err := srv.Client().Get(srv.URL + "/?filter=closed&sort=age")
@@ -240,7 +240,7 @@ func TestBackButtonReachesTheServer(t *testing.T) {
 	c := &table{}
 	h := New(func() Component { return c })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, sid := getPage(t, srv)
@@ -273,7 +273,7 @@ func TestBackButtonDoesNotBounceTheBrowser(t *testing.T) {
 	c := &table{}
 	h := New(func() Component { return c })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	_, sid := getPage(t, srv)
@@ -297,7 +297,7 @@ func TestBackButtonDoesNotBounceTheBrowser(t *testing.T) {
 func TestNavRejectsRubbish(t *testing.T) {
 	h := New(func() Component { return &table{} })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	_, sid := getPage(t, srv)
@@ -325,7 +325,7 @@ func TestNavStaysInsideTheMount(t *testing.T) {
 	h.Prefix = "/app"
 	mux := http.NewServeMux()
 	mux.Handle("/app/", h)
-	srv := httptest.NewServer(mux)
+	srv := httptest.NewTestServer(t, mux)
 	t.Cleanup(srv.Close)
 
 	_, sid := getPage(t, srv, "/app/")

@@ -176,7 +176,7 @@ func TestUploadRoundTrip(t *testing.T) {
 	c := &gallery{dir: t.TempDir()}
 	h := New(func() Component { return c })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, sid := getPage(t, srv)
@@ -216,7 +216,7 @@ func TestUploadedFilesAreCleanedUp(t *testing.T) {
 	c := &keeper{}
 	h := New(func() Component { return c })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, sid := getPage(t, srv)
@@ -258,7 +258,7 @@ func TestUploadTypeIsCheckedAgainstTheBytes(t *testing.T) {
 	c := &gallery{}
 	h := New(func() Component { return c })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, sid := getPage(t, srv)
@@ -302,7 +302,7 @@ func TestTextUploadsSurviveDetection(t *testing.T) {
 	c := &spreadsheet{}
 	h := New(func() Component { return c })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, sid := getPage(t, srv)
@@ -374,7 +374,7 @@ func TestUploadLimitsAreEnforcedServerSide(t *testing.T) {
 			c := &gallery{}
 			h := New(func() Component { return c })
 			h.Logger = quietLogger()
-			srv := httptest.NewServer(h)
+			srv := httptest.NewTestServer(t, h)
 			t.Cleanup(srv.Close)
 
 			page, sid := getPage(t, srv)
@@ -417,7 +417,7 @@ func TestUploadAcceptMatching(t *testing.T) {
 func TestUploadRejectsUnknownTargets(t *testing.T) {
 	h := New(func() Component { return &gallery{} })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	_, sid := getPage(t, srv)
@@ -439,7 +439,7 @@ func TestUploadRejectsUnknownTargets(t *testing.T) {
 func TestUploadNeedsAHandler(t *testing.T) {
 	h := New(func() Component { return &declaresOnly{} })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, sid := getPage(t, srv)
@@ -505,7 +505,7 @@ func TestSaveCleansTheClientFilename(t *testing.T) {
 func TestShimUploadsWithXHR(t *testing.T) {
 	h := New(func() Component { return &gallery{} })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, _ := getPage(t, srv)

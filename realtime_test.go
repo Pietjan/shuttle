@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/a-h/templ"
@@ -207,22 +208,24 @@ func TestPresenceTracksWhoIsHere(t *testing.T) {
 // TestSubscriptionsStopWithTheSession: a message arriving after eviction
 // must not reach a component that has been unmounted.
 func TestSubscriptionsStopWithTheSession(t *testing.T) {
-	broker, pres := NewMemoryBroker(), newPresence()
-	r := &room{Topic: "lobby"}
-	sess := mountSession(t, "a", r, broker, pres)
+	synctest.Test(t, func(t *testing.T) {
+		broker, pres := NewMemoryBroker(), newPresence()
+		r := &room{Topic: "lobby"}
+		sess := mountSession(t, "a", r, broker, pres)
 
-	sess.close(context.Background())
-	if err := broker.Publish(context.Background(), "lobby", "after"); err != nil {
-		t.Fatalf("publish: %v", err)
-	}
-	time.Sleep(50 * time.Millisecond)
-
-	msgs, _ := r.seen()
-	for _, m := range msgs {
-		if m == "after" {
-			t.Error("a closed session still received a message")
+		sess.close(context.Background())
+		if err := broker.Publish(context.Background(), "lobby", "after"); err != nil {
+			t.Fatalf("publish: %v", err)
 		}
-	}
+		time.Sleep(50 * time.Millisecond)
+
+		msgs, _ := r.seen()
+		for _, m := range msgs {
+			if m == "after" {
+				t.Error("a closed session still received a message")
+			}
+		}
+	})
 }
 
 // TestSubscribeNeedsAnInformer, rather than subscribing to nothing.
@@ -238,27 +241,29 @@ func TestSubscribeNeedsAnInformer(t *testing.T) {
 
 // TestEveryTicksAndStops.
 func TestEveryTicksAndStops(t *testing.T) {
-	c := &clock{}
-	sess := newSession("test", c)
-	if err := sess.call(context.Background(), func() error {
-		if err := c.Mount(context.Background(), nil); err != nil {
+	synctest.Test(t, func(t *testing.T) {
+		c := &clock{}
+		sess := newSession("test", c)
+		if err := sess.call(context.Background(), func() error {
+			if err := c.Mount(context.Background(), nil); err != nil {
+				return err
+			}
+			_, err := sess.Render(context.Background())
 			return err
+		}); err != nil {
+			t.Fatalf("mount: %v", err)
 		}
-		_, err := sess.Render(context.Background())
-		return err
-	}); err != nil {
-		t.Fatalf("mount: %v", err)
-	}
 
-	waitFor(t, 2*time.Second, func() bool { return c.count() >= 3 }, "the timer to tick")
+		waitFor(t, 2*time.Second, func() bool { return c.count() >= 3 }, "the timer to tick")
 
-	sess.close(context.Background())
-	settled := c.count()
-	time.Sleep(60 * time.Millisecond)
+		sess.close(context.Background())
+		settled := c.count()
+		time.Sleep(60 * time.Millisecond)
 
-	if got := c.count(); got != settled {
-		t.Errorf("timer kept running after close: %d then %d", settled, got)
-	}
+		if got := c.count(); got != settled {
+			t.Errorf("timer kept running after close: %d then %d", settled, got)
+		}
+	})
 }
 
 // TestEveryRejectsANonPositiveInterval, which would spin.
@@ -298,40 +303,42 @@ func TestRealtimeMethodsNeedAMount(t *testing.T) {
 // a pub/sub message, a timer tick and an action can never be inside the
 // same component at once, so its fields need no locks of their own.
 func TestWorkIsSerialised(t *testing.T) {
-	sess := newSession("test", &counter{})
-	t.Cleanup(func() { sess.close(context.Background()) })
+	synctest.Test(t, func(t *testing.T) {
+		sess := newSession("test", &counter{})
+		t.Cleanup(func() { sess.close(context.Background()) })
 
-	var (
-		inside int
-		clash  bool
-		mu     sync.Mutex
-		wg     sync.WaitGroup
-	)
+		var (
+			inside int
+			clash  bool
+			mu     sync.Mutex
+			wg     sync.WaitGroup
+		)
 
-	for range 50 {
-		wg.Go(func() {
-			_ = sess.call(context.Background(), func() error {
-				mu.Lock()
-				inside++
-				if inside > 1 {
-					clash = true
-				}
-				mu.Unlock()
+		for range 50 {
+			wg.Go(func() {
+				_ = sess.call(context.Background(), func() error {
+					mu.Lock()
+					inside++
+					if inside > 1 {
+						clash = true
+					}
+					mu.Unlock()
 
-				time.Sleep(time.Millisecond)
+					time.Sleep(time.Millisecond)
 
-				mu.Lock()
-				inside--
-				mu.Unlock()
-				return nil
+					mu.Lock()
+					inside--
+					mu.Unlock()
+					return nil
+				})
 			})
-		})
-	}
-	wg.Wait()
+		}
+		wg.Wait()
 
-	if clash {
-		t.Error("two pieces of session work ran at the same time")
-	}
+		if clash {
+			t.Error("two pieces of session work ran at the same time")
+		}
+	})
 }
 
 // TestBrokerUnsubscribeIsIdempotent, since teardown can run more than once.
@@ -385,51 +392,53 @@ func TestPublishFromASubscriberDoesNotDeadlock(t *testing.T) {
 // page. Datastar reports that as PatchElementsNoTargetsFound and the server
 // never hears about it.
 func TestUnmountStopsATimer(t *testing.T) {
-	l := &ticking{Labels: []string{"a"}}
-	sess := newSession("test", l)
-	t.Cleanup(func() { sess.close(context.Background()) })
-	ctx := context.Background()
+	synctest.Test(t, func(t *testing.T) {
+		l := &ticking{Labels: []string{"a"}}
+		sess := newSession("test", l)
+		t.Cleanup(func() { sess.close(context.Background()) })
+		ctx := context.Background()
 
-	if _, err := sess.Render(ctx); err != nil {
-		t.Fatalf("render: %v", err)
-	}
+		if _, err := sess.Render(ctx); err != nil {
+			t.Fatalf("render: %v", err)
+		}
 
-	n, ok := sess.node("c-1")
-	if !ok {
-		t.Fatal("child not mounted")
-	}
-	child := n.cmp.(*ticker)
-	waitFor(t, time.Second, func() bool { return child.count() > 0 }, "the timer to tick")
+		n, ok := sess.node("c-1")
+		if !ok {
+			t.Fatal("child not mounted")
+		}
+		child := n.cmp.(*ticker)
+		waitFor(t, time.Second, func() bool { return child.count() > 0 }, "the timer to tick")
 
-	// Stop rendering its key: the child is unmounted. Both the field write
-	// and the render go through the session's goroutine, the way a handler
-	// does them - from here they race the timer this test is about.
-	if err := sess.call(ctx, func() error {
-		l.Labels = nil
-		_, err := sess.Render(ctx)
-		return err
-	}); err != nil {
-		t.Fatalf("re-render: %v", err)
-	}
-	if _, still := sess.node("c-1"); still {
-		t.Fatal("child was not unmounted")
-	}
+		// Stop rendering its key: the child is unmounted. Both the field write
+		// and the render go through the session's goroutine, the way a handler
+		// does them - from here they race the timer this test is about.
+		if err := sess.call(ctx, func() error {
+			l.Labels = nil
+			_, err := sess.Render(ctx)
+			return err
+		}); err != nil {
+			t.Fatalf("re-render: %v", err)
+		}
+		if _, still := sess.node("c-1"); still {
+			t.Fatal("child was not unmounted")
+		}
 
-	// Settle before the baseline, so a tick queued before the unmount is
-	// counted in it rather than arriving afterwards and reading as one the
-	// timer kept firing.
-	settle(t, sess)
-	settled := child.count()
+		// Settle before the baseline, so a tick queued before the unmount is
+		// counted in it rather than arriving afterwards and reading as one the
+		// timer kept firing.
+		settle(t, sess)
+		settled := child.count()
 
-	// The wait is the test. A timer that failed to stop needs wall-clock
-	// time to prove it, and 80ms is sixteen of its intervals - settling
-	// alone would pass the moment the ticker went quiet for a microsecond.
-	time.Sleep(80 * time.Millisecond)
+		// The wait is the test. A timer that failed to stop needs wall-clock
+		// time to prove it, and 80ms is sixteen of its intervals - settling
+		// alone would pass the moment the ticker went quiet for a microsecond.
+		time.Sleep(80 * time.Millisecond)
 
-	settle(t, sess)
-	if got := child.count(); got != settled {
-		t.Errorf("timer kept firing after unmount: %d then %d", settled, got)
-	}
+		settle(t, sess)
+		if got := child.count(); got != settled {
+			t.Errorf("timer kept firing after unmount: %d then %d", settled, got)
+		}
+	})
 }
 
 // settle waits for the session to finish everything already queued. The

@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/a-h/templ"
@@ -167,13 +168,21 @@ type sseReader struct {
 func openStream(t *testing.T, srv *httptest.Server, sid string) *sseReader {
 	t.Helper()
 
-	req, err := http.NewRequest(http.MethodGet, srv.URL+routePrefix+"/live", nil)
+	// The request carries its own cancel, and close cancels before closing
+	// the body. Closing alone triggers Go 1.27's auto-drain of unread
+	// bodies, and draining a stream that never ends blocks forever - under
+	// synctest it blocks the whole bubble, since the drain waits on the
+	// body's mutex rather than anything the fake clock can see past.
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+routePrefix+"/live", nil)
 	if err != nil {
+		cancel()
 		t.Fatalf("stream request: %v", err)
 	}
 	req.Header.Set(SessionHeader, sid)
 	resp, err := srv.Client().Do(req)
 	if err != nil {
+		cancel()
 		t.Fatalf("open stream: %v", err)
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -186,6 +195,11 @@ func openStream(t *testing.T, srv *httptest.Server, sid string) *sseReader {
 	}
 
 	r := newSSEReader(resp.Body)
+	body := r.close
+	r.close = func() {
+		cancel()
+		body()
+	}
 	t.Cleanup(r.close)
 	r.greeting(t)
 	return r
@@ -303,7 +317,7 @@ func post(t *testing.T, srv *httptest.Server, sid, path string) int {
 // render: a complete document, rendered on the server, that already shows
 // the component's state.
 func TestPageWorksBeforeAnyScriptRuns(t *testing.T) {
-	srv := httptest.NewServer(New(func() Component { return &counter{Count: 7} }))
+	srv := httptest.NewTestServer(t, New(func() Component { return &counter{Count: 7} }))
 	// Registered rather than deferred: a stream is a long-lived request, and
 	// Close waits for it. Cleanups run last-in-first-out, so any stream
 	// opened below is closed before the server starts waiting.
@@ -333,7 +347,7 @@ func TestPageWorksBeforeAnyScriptRuns(t *testing.T) {
 // off, a hidden tab's stream closes and Grace later evicts the session, so
 // returning to that tab reloads the page and loses it.
 func TestAttachOptionsAreNotOptional(t *testing.T) {
-	srv := httptest.NewServer(New(func() Component { return &counter{} }))
+	srv := httptest.NewTestServer(t, New(func() Component { return &counter{} }))
 	// Registered rather than deferred: a stream is a long-lived request, and
 	// Close waits for it. Cleanups run last-in-first-out, so any stream
 	// opened below is closed before the server starts waiting.
@@ -363,7 +377,7 @@ func TestOpenWhenHiddenCanBeTurnedOff(t *testing.T) {
 	h := New(func() Component { return &counter{} })
 	h.Logger = quietLogger()
 	h.OpenWhenHidden = &off
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, _ := getPage(t, srv)
@@ -393,7 +407,7 @@ func TestGraceIsConfigurable(t *testing.T) {
 // TestPageIsNotCacheable: the document embeds the session id, which is the
 // page's capability for every action it renders.
 func TestPageIsNotCacheable(t *testing.T) {
-	srv := httptest.NewServer(New(func() Component { return &counter{} }))
+	srv := httptest.NewTestServer(t, New(func() Component { return &counter{} }))
 	// Registered rather than deferred: a stream is a long-lived request, and
 	// Close waits for it. Cleanups run last-in-first-out, so any stream
 	// opened below is closed before the server starts waiting.
@@ -433,7 +447,7 @@ func TestDeadAndLiveRendersMatch(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := New(tc.make)
-			srv := httptest.NewServer(h)
+			srv := httptest.NewTestServer(t, h)
 			// Registered rather than deferred: a stream is a long-lived request, and
 			// Close waits for it. Cleanups run last-in-first-out, so any stream
 			// opened below is closed before the server starts waiting.
@@ -490,7 +504,7 @@ func TestLoomIDsAreStableAcrossRenders(t *testing.T) {
 // is served, a stream attaches to it, a click reaches a closure holding
 // server-side state, and the morph comes back down the stream.
 func TestCounterRoundTrip(t *testing.T) {
-	srv := httptest.NewServer(New(func() Component { return &counter{} }))
+	srv := httptest.NewTestServer(t, New(func() Component { return &counter{} }))
 	// Registered rather than deferred: a stream is a long-lived request, and
 	// Close waits for it. Cleanups run last-in-first-out, so any stream
 	// opened below is closed before the server starts waiting.
@@ -545,7 +559,7 @@ func TestServerPushReachesThePage(t *testing.T) {
 	c := &counter{}
 	h := New(func() Component { return c })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	_, sid := getPage(t, srv)
@@ -577,7 +591,7 @@ func TestPushBeforeAttachIsNotLost(t *testing.T) {
 	c := &counter{}
 	h := New(func() Component { return c })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	_, sid := getPage(t, srv)
@@ -656,7 +670,7 @@ func lastPathSegment(url string) string {
 func TestUnknownSessionAndAction(t *testing.T) {
 	h := New(func() Component { return &counter{} })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	// Registered rather than deferred: a stream is a long-lived request, and
 	// Close waits for it. Cleanups run last-in-first-out, so any stream
 	// opened below is closed before the server starts waiting.
@@ -713,7 +727,7 @@ func TestUnknownSessionAndAction(t *testing.T) {
 // holder is almost always the same client's newer attempt.
 func TestSecondStreamTakesOver(t *testing.T) {
 	h := New(func() Component { return &counter{} })
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	// Registered rather than deferred: a stream is a long-lived request, and
 	// Close waits for it. Cleanups run last-in-first-out, so any stream
 	// opened below is closed before the server starts waiting.
@@ -741,7 +755,7 @@ func TestSecondStreamTakesOver(t *testing.T) {
 func TestActionPanicKeepsTheSessionAlive(t *testing.T) {
 	h := New(func() Component { return &panicker{} })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	// Registered rather than deferred: a stream is a long-lived request, and
 	// Close waits for it. Cleanups run last-in-first-out, so any stream
 	// opened below is closed before the server starts waiting.
@@ -774,7 +788,7 @@ func TestActionPanicKeepsTheSessionAlive(t *testing.T) {
 func TestSessionOutlivesItsStream(t *testing.T) {
 	h := New(func() Component { return &counter{} })
 	h.sessions.grace = 40 * time.Millisecond
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	// Registered rather than deferred: a stream is a long-lived request, and
 	// Close waits for it. Cleanups run last-in-first-out, so any stream
 	// opened below is closed before the server starts waiting.
@@ -804,7 +818,7 @@ func TestSessionOutlivesItsStream(t *testing.T) {
 func TestCrossOriginPostIsRefused(t *testing.T) {
 	h := New(func() Component { return &counter{} })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, sid := getPage(t, srv)
@@ -861,7 +875,7 @@ func TestCheckOriginOverridesTheDefault(t *testing.T) {
 	h.CheckOrigin = func(r *http.Request) bool {
 		return r.Header.Get("Origin") == "https://friend.example"
 	}
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, sid := getPage(t, srv)
@@ -901,7 +915,7 @@ func TestCheckOriginOverridesTheDefault(t *testing.T) {
 // whatever middleware fronts the handler.
 func TestCloseEndsTheSessionAndSendsThePageHome(t *testing.T) {
 	h := New(func() Component { return &counter{} })
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	_, sid := getPage(t, srv)
@@ -944,7 +958,7 @@ func TestCloseEndsTheSessionAndSendsThePageHome(t *testing.T) {
 func TestOwnerIsSetFromMount(t *testing.T) {
 	h := New(func() Component { return &owned{} })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	_, sid := getPage(t, srv)
@@ -979,7 +993,7 @@ func (o *owned) Render(context.Context) templ.Component {
 // however many tabs they left open, and each is its own session.
 func TestCloseOwnerEndsEveryPageOfTheirs(t *testing.T) {
 	h := New(func() Component { return &counter{} })
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	var theirs []string
@@ -1022,7 +1036,7 @@ func TestCloseOwnerEndsEveryPageOfTheirs(t *testing.T) {
 func TestUnattachedSessionIsCollected(t *testing.T) {
 	h := New(func() Component { return &counter{} })
 	h.sessions.attach = 30 * time.Millisecond
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	// Registered rather than deferred: a stream is a long-lived request, and
 	// Close waits for it. Cleanups run last-in-first-out, so any stream
 	// opened below is closed before the server starts waiting.
@@ -1040,7 +1054,7 @@ func TestUnmountRunsOnEviction(t *testing.T) {
 	c := &closer{unmounted: make(chan struct{})}
 	h := New(func() Component { return c })
 	h.sessions.attach = 20 * time.Millisecond
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	// Registered rather than deferred: a stream is a long-lived request, and
 	// Close waits for it. Cleanups run last-in-first-out, so any stream
 	// opened below is closed before the server starts waiting.
@@ -1077,7 +1091,7 @@ func (c *closer) done() bool {
 
 // TestMountSeesParams.
 func TestMountSeesParams(t *testing.T) {
-	srv := httptest.NewServer(New(func() Component { return &mounted{} }))
+	srv := httptest.NewTestServer(t, New(func() Component { return &mounted{} }))
 	// Registered rather than deferred: a stream is a long-lived request, and
 	// Close waits for it. Cleanups run last-in-first-out, so any stream
 	// opened below is closed before the server starts waiting.
@@ -1181,7 +1195,7 @@ func TestSessionCapIsEnforced(t *testing.T) {
 	h := New(func() Component { return &counter{} })
 	h.Logger = quietLogger()
 	h.sessions.max = 2
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	// Registered rather than deferred: a stream is a long-lived request, and
 	// Close waits for it. Cleanups run last-in-first-out, so any stream
 	// opened below is closed before the server starts waiting.
@@ -1228,7 +1242,7 @@ func waitFor(t *testing.T, within time.Duration, cond func() bool, what string) 
 func TestHeadCostsNothing(t *testing.T) {
 	h := New(func() Component { return &counter{} })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	head, err := srv.Client().Head(srv.URL + "/")
@@ -1258,4 +1272,60 @@ func TestHeadCostsNothing(t *testing.T) {
 
 	// The slot is still free: a real stream attaches and greets.
 	openStream(t, srv, sid)
+}
+
+// TestSessionLifetimeRunsOnItsDocumentedSchedule exercises the real
+// numbers: the 30s attach window, the 25s heartbeat that is the only way
+// the server learns a client died, and the 30s grace that follows. Every
+// other lifetime test shortens these to keep the run fast; this one runs
+// them verbatim on synctest's fake clock over the in-memory network, so
+// the schedule the docs promise is what is actually asserted - in
+// milliseconds.
+func TestSessionLifetimeRunsOnItsDocumentedSchedule(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := New(func() Component { return &counter{} })
+		h.Logger = quietLogger()
+		srv := httptest.NewTestServer(t, h)
+		t.Cleanup(srv.Close)
+
+		// A page that never opens its stream is collected after the attach
+		// window - a crawled or closed-immediately page must not hold a
+		// component tree.
+		getPage(t, srv)
+		if got := h.sessions.len(); got != 1 {
+			t.Fatalf("%d sessions after a page load, want 1", got)
+		}
+		time.Sleep(attachWindow + time.Second)
+		synctest.Wait()
+		if got := h.sessions.len(); got != 0 {
+			t.Fatalf("an unattached session outlived the %v attach window", attachWindow)
+		}
+
+		// A connected page holds its session for as long as the stream
+		// lives - two minutes of heartbeats change nothing.
+		_, sid := getPage(t, srv)
+		stream := openStream(t, srv, sid)
+		time.Sleep(2 * time.Minute)
+		synctest.Wait()
+		if got := h.sessions.len(); got != 1 {
+			t.Fatalf("%d sessions while the stream is attached, want 1", got)
+		}
+
+		// The client disconnects. Grace runs from the moment the server
+		// notices - immediately here, since closing the in-memory conn
+		// fires the request context - so the session must survive to just
+		// short of Grace, for the reconnect it exists to allow, and be
+		// gone just after.
+		stream.close()
+		time.Sleep(DefaultGrace - time.Second)
+		synctest.Wait()
+		if got := h.sessions.len(); got != 1 {
+			t.Errorf("evicted before its %v grace had elapsed (%d sessions)", DefaultGrace, got)
+		}
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+		if got := h.sessions.len(); got != 0 {
+			t.Errorf("a disconnected session outlived its grace (%d sessions)", got)
+		}
+	})
 }

@@ -73,7 +73,7 @@ func (b *breaks) Render(ctx context.Context) templ.Component {
 func TestRenderErrorOnFirstPaintIsAnHTTPError(t *testing.T) {
 	h := New(func() Component { return &breaks{Broken: true} })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	resp, err := srv.Client().Get(srv.URL + "/")
@@ -102,7 +102,7 @@ func TestRenderErrorAfterAnActionOnlyReachesTheLog(t *testing.T) {
 	var log syncBuffer
 	h := New(func() Component { return &breaks{} })
 	h.Logger = slog.New(slog.NewTextHandler(&log, nil))
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, sid := getPage(t, srv)
@@ -200,7 +200,7 @@ func TestPanicInRenderDoesNotKillTheSession(t *testing.T) {
 	c := &exploder{}
 	h := New(func() Component { return c })
 	h.Logger = slog.New(slog.NewTextHandler(&log, nil))
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, sid := getPage(t, srv)
@@ -255,7 +255,7 @@ func (e *exploder) Render(ctx context.Context) templ.Component {
 func TestPanicInAnActionKeepsTheSessionUsable(t *testing.T) {
 	h := New(func() Component { return &panicker{} })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, sid := getPage(t, srv)
@@ -287,7 +287,7 @@ func TestTheCapabilityNeverReachesTheLog(t *testing.T) {
 	h := New(func() Component { return &panicker{} })
 	h.Logger = slog.New(slog.NewTextHandler(&log, nil))
 	h.Debug = true
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, sid := getPage(t, srv)
@@ -324,7 +324,7 @@ func TestTheCapabilityNeverReachesTheLog(t *testing.T) {
 // hands the client, from all four kinds of request.
 func TestTheCapabilityNeverReachesAURL(t *testing.T) {
 	h := New(func() Component { return &gallery{} })
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, sid := getPage(t, srv)
@@ -363,7 +363,7 @@ func TestInternalErrorsDoNotReachTheClient(t *testing.T) {
 	var log syncBuffer
 	h := New(func() Component { return &panicker{} })
 	h.Logger = slog.New(slog.NewTextHandler(&log, nil))
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, sid := getPage(t, srv)
@@ -433,7 +433,7 @@ func TestActionBodiesAreCapped(t *testing.T) {
 	h := New(func() Component { return &counter{} })
 	h.Logger = quietLogger()
 	h.MaxSignalBytes = 1 << 10
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, sid := getPage(t, srv)
@@ -456,7 +456,7 @@ func TestActionBodiesAreCapped(t *testing.T) {
 func TestTransportResponsesAreNotCacheable(t *testing.T) {
 	h := New(func() Component { return &counter{} })
 	h.Logger = quietLogger()
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	page, sid := getPage(t, srv)
@@ -509,7 +509,7 @@ func TestRenderErrorReachesTheHandlerLogger(t *testing.T) {
 	c := &breaks{}
 	h := New(func() Component { return c })
 	h.Logger = slog.New(slog.NewTextHandler(&log, nil))
-	srv := httptest.NewServer(h)
+	srv := httptest.NewTestServer(t, h)
 	t.Cleanup(srv.Close)
 
 	_, sid := getPage(t, srv)

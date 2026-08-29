@@ -1010,6 +1010,26 @@ Four things about the setup, each of which cost a run to find:
 and a test said so. What belongs here is why a decision was made; what belongs there is whether it
 still holds.
 
+## Go 1.27 testing conventions
+
+The unit suites lean on two things Go 1.27 made available, and both carry rules:
+
+- **`testing/synctest` for anything time-driven.** Timer, teardown-race and lifetime tests are
+  wrapped in `synctest.Test`; the sleeps inside are real durations on a fake clock, so "wait 80ms
+  to prove the ticker stopped" costs nothing and never flakes.
+  `TestSessionLifetimeRunsOnItsDocumentedSchedule` runs the attach window and grace verbatim - 30
+  real seconds each - in milliseconds, and `TestTheKitRunsUnderSynctest` pins that the testing kit
+  works inside a bubble, which closes the old "`Every` is untestable without wall-clock sleeps"
+  gap. The rule inside a bubble: everything must block *durably* (channels, sleeps, the fake
+  network) - a goroutine stuck on a bare mutex freezes the clock and the test hangs.
+- **`httptest.NewTestServer` everywhere a browser is not required.** Every unit-test server runs
+  on the in-memory fake network: no TCP, no ports, synctest-compatible. Two sharp edges, both hit:
+  `srv.URL` is only materialised by the first `Client()` call, so helpers call `Client()` before
+  building a request from it; and Go 1.27 auto-drains unread HTTP/1 response bodies on close,
+  which on a never-ending SSE stream is a drain that never returns - `openStream` cancels its
+  request context before closing the body, or (under synctest) the drain's mutex wait freezes the
+  bubble.
+
 ## CI
 
 `.github/workflows/ci.yml`, same shape as toto's: unit tests with `-race` on ubuntu and windows,
