@@ -305,6 +305,18 @@ func (l *Live) run(what string, fn func() error) {
 	l.settle()
 }
 
+// Settle waits for the session's goroutine to finish everything already
+// queued and collects what it pushed. The kit's own helpers settle for
+// themselves; this is for work a test causes outside them - a Do closure, a
+// publish, a component method like Feed.Prepend run through Do - whose
+// renders and stream operations would otherwise still be in flight when the
+// next assertion reads the markup.
+func (l *Live) Settle() *Live {
+	l.tb.Helper()
+	l.settle()
+	return l
+}
+
 // settle waits for the session's goroutine to finish what it was given and
 // collects whatever it pushed.
 func (l *Live) settle() {

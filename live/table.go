@@ -20,7 +20,7 @@ import (
 	"github.com/pietjan/shuttle"
 )
 
-// Query is what a Table asks its data source for.
+// Query is what a Table or Feed asks its data source for.
 type Query struct {
 	// Filter is the current search text.
 	Filter string
@@ -29,6 +29,13 @@ type Query struct {
 	Desc bool
 	// Offset and Limit are the page being shown.
 	Offset, Limit int
+	// Cursor is where the page starts, for a source that paginates by key
+	// rather than by position - it is whatever the previous page's
+	// [Page.Next] said, and "" for the first page. Only a [Feed] sends it:
+	// a table's numbered pages are positions by definition. A source that
+	// answers with Next is expected to honour Cursor and may ignore
+	// Offset; one that never sets Next can ignore this field entirely.
+	Cursor string
 }
 
 // Page is what a data source answers with.
@@ -40,6 +47,13 @@ type Page[T any] struct {
 	// pager to count with. Negative means unknown, and the pager falls back
 	// to "there is more" rather than "page 3 of 9".
 	Total int
+	// Next is the cursor of the page after this one, for sources that
+	// paginate by key: typically the last row's id or timestamp, whatever
+	// the source can seek to. Setting it is what opts a [Feed] into keyset
+	// pagination - the next Query carries it as Cursor, and the feed is
+	// not exhausted while it is set. Leave it "" on the last page, and
+	// always for a source that paginates by Offset. A [Table] ignores it.
+	Next string
 }
 
 // Column describes one column of a Table.

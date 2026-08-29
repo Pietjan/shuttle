@@ -83,11 +83,22 @@ type Feed[T any] struct {
 	// first is the page rendered into the container - the only rows this
 	// component holds.
 	first Page[T]
-	// sent is how many rows the client has been given, and so the offset
-	// the next page starts at.
+	// sent is how many rows the source has provided, and so the offset the
+	// next page starts at.
 	sent   int
 	done   bool
 	failed error
+	// cursor is where the next page starts for a keyset source - the last
+	// page's Next, carried into the next Query. "" means the source
+	// paginates by offset, or the feed has not fetched yet.
+	cursor string
+	// prepended counts rows pushed in at the top with Prepend. It shifts
+	// every offset-mode fetch, because each prepended row is one the
+	// source now serves at its head - without the shift, the next page
+	// would re-serve rows the reader already has. It also numbers the
+	// prepended keys, negatively, so they can never collide with the
+	// appended ones counting up from zero.
+	prepended int
 }
 
 // Mount loads the first page.
@@ -96,9 +107,10 @@ func (f *Feed[T]) Mount(ctx context.Context, _ shuttle.Params) error {
 	return nil
 }
 
-// Loaded reports how many rows the reader has been given so far. The rows
-// themselves are in the browser; this is the count the server still knows.
-func (f *Feed[T]) Loaded() int { return f.sent }
+// Loaded reports how many rows the reader has been given so far - pages
+// from the source and rows pushed in with Prepend. The rows themselves are
+// in the browser; this is the count the server still knows.
+func (f *Feed[T]) Loaded() int { return f.sent + f.prepended }
 
 // Done reports whether the source is exhausted.
 func (f *Feed[T]) Done() bool { return f.done }
@@ -131,6 +143,7 @@ func (f *Feed[T]) Reset(ctx context.Context) error {
 // the page must render around it, so there is nothing to return.
 func (f *Feed[T]) reload(ctx context.Context) {
 	f.failed, f.sent, f.done = nil, 0, false
+	f.cursor, f.prepended = "", 0
 
 	page, err := f.fetch(ctx, 0)
 	if err != nil {
@@ -139,6 +152,7 @@ func (f *Feed[T]) reload(ctx context.Context) {
 	}
 	f.first = page
 	f.sent = len(page.Rows)
+	f.cursor = page.Next
 	f.done = f.exhausted(page)
 }
 
@@ -180,8 +194,48 @@ func (f *Feed[T]) more(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// The cursor only moves once the whole page reached the container - a
+	// partial append retries the same page, and must ask for it again.
+	if appended == len(page.Rows) {
+		f.cursor = page.Next
+	}
 	f.done = f.exhausted(page)
 	return nil
+}
+
+// Prepend pushes one row in at the top of the feed - the pub/sub pairing:
+// something was just created, every subscribed page hears about it, and
+// each feed shows it without re-rendering anything it no longer holds.
+// Call it from HandleInfo, an action, or a Do closure, like anything else
+// that touches the component.
+//
+// The contract is that the source now serves this row at its head - a row
+// that was inserted, whose event this is. That is what lets the feed keep
+// its cursor honest: a keyset source is unaffected (the cursor points into
+// the sequence below), and an offset source has everything shifted down by
+// one, which the feed compensates for so the next page does not re-serve a
+// row the reader already has. A row the source will never serve does not
+// belong here - the compensation would then skip a real one.
+//
+// Like every streamed row it lives only in the browser: a full re-render
+// (a reconnect outside the grace window) rebuilds from the source, which
+// serves it at the top anyway - that is the contract again.
+func (f *Feed[T]) Prepend(ctx context.Context, row T) error {
+	s := f.Stream(feedStream)
+	if s == nil {
+		return shuttle.ErrNotMounted
+	}
+
+	f.prepended++
+	// Negative keys count away from the appended rows' zero, so however
+	// many arrive from either end they can never collide.
+	if err := s.Prepend(ctx, key(-f.prepended), f.row(-f.prepended, row)); err != nil {
+		return err
+	}
+	// The feed's own markup can have changed shape - an empty feed showing
+	// its Empty note has rows now - so re-render; identical bytes are
+	// dropped anyway.
+	return f.Push(ctx)
 }
 
 // Held reports how many rows this component is keeping in memory, which is
@@ -215,12 +269,18 @@ func (f *Feed[T]) stream(ctx context.Context, rows []T, at int) (int, error) {
 	return len(rows), nil
 }
 
-// fetch asks the source for the page starting at offset.
+// fetch asks the source for the page starting at offset - shifted by the
+// prepended rows, which sit at the source's head above every position the
+// feed has seen - and at the cursor, when the source paginates by key.
 func (f *Feed[T]) fetch(ctx context.Context, offset int) (Page[T], error) {
 	if f.Load == nil {
 		return Page[T]{}, nil
 	}
-	return f.Load(ctx, Query{Offset: offset, Limit: f.limit()})
+	return f.Load(ctx, Query{
+		Offset: offset + f.prepended,
+		Limit:  f.limit(),
+		Cursor: f.cursor,
+	})
 }
 
 // exhausted reports whether page was the last one. Call it after sent has
@@ -241,8 +301,18 @@ func (f *Feed[T]) exhausted(page Page[T]) bool {
 	if len(page.Rows) == 0 {
 		return true
 	}
+	// A cursor for the next page is the source saying there is one. It is
+	// checked after the empty guard, not before: a source that answers
+	// Next with no rows is contradicting itself, and believing the rows is
+	// what cannot loop.
+	if page.Next != "" {
+		return false
+	}
 	if page.Total >= 0 {
-		return f.sent >= page.Total
+		// The source's total counts the prepended rows too - they are at
+		// its head, that is Prepend's contract - so the reader has them
+		// plus everything fetched below.
+		return f.sent+f.prepended >= page.Total
 	}
 	return len(page.Rows) < f.limit()
 }
@@ -313,7 +383,7 @@ func (f *Feed[T]) footer(ctx context.Context) templ.Component {
 		return f.failure(ctx)
 	case !f.done:
 		return f.sentinel(ctx)
-	case f.sent == 0 && f.Empty != "":
+	case f.sent+f.prepended == 0 && f.Empty != "":
 		return note(f.Empty)
 	case f.End != "":
 		return note(f.End)

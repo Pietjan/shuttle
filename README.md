@@ -346,6 +346,18 @@ starts at the first page again. Call `Reset` when whatever `Load` closes over ch
 container and streams the new first page, because markup written into an ignored container never
 arrives.
 
+**New rows arrive at the top with `Prepend`** — the pub/sub pairing: something is created, every
+subscribed page hears about it in `HandleInfo`, and each feed shows it without re-rendering
+anything it no longer holds. The contract is that the source now serves that row at its head — the
+row was inserted and this is its event — which is what keeps the cursor honest: the feed shifts an
+offset source's next page so nothing is served twice, and leaves a keyset cursor alone.
+
+**Sources that paginate by key opt in through `Page.Next`**: return the cursor of the following
+page — the last row's id, a timestamp, whatever the source can seek to — and the feed carries it
+back as `Query.Cursor` instead of trusting offsets, which is what survives rows being inserted and
+deleted under a long scroll. Leave `Next` empty on the last page and the feed stops. A `Table`
+ignores both fields: numbered pages are positions by definition.
+
 `shuttle.OnIntersect` is the binding underneath it, for a sentinel of your own. Note the attribute is
 `data-on-intersect`, hyphenated and keyless — in Datastar v1 this is a plugin in its own right rather
 than an event name, so `data-on:intersect` is an error. It fires **every** time the element comes

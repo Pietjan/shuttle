@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -338,5 +339,157 @@ func TestRetryAfterAFirstPageFailureRecoversTheFirstPage(t *testing.T) {
 	}
 	if f.Loaded() != 3 {
 		t.Errorf("Loaded() = %d, want 3", f.Loaded())
+	}
+}
+
+// TestPrependShowsARowAtTheTop - the pub/sub pairing. The row goes down the
+// stream as a prepend with a key that cannot collide with the appended
+// ones, and the feed's offset cursor shifts so the next page from an
+// offset source does not re-serve a row the reader already has.
+func TestPrependShowsARowAtTheTop(t *testing.T) {
+	all := posts(6)
+	f := newFeed(all, 6)
+	l := shuttle.Test(t, f)
+
+	// Something new lands at the source's head, and the feed is told.
+	all2 := append([]string{"post-new"}, all...)
+	if err := f.Do(func(ctx context.Context) error {
+		f.Load = loadPosts(all2, 7)
+		return f.Prepend(ctx, "post-new")
+	}); err != nil {
+		t.Fatalf("prepend: %v", err)
+	}
+	l.Settle()
+
+	patches := strings.Join(l.Patches(), "\n")
+	if !strings.Contains(patches, "post-new") {
+		t.Fatalf("the prepended row was not streamed: %s", patches)
+	}
+	if f.Loaded() != 4 {
+		t.Errorf("Loaded() = %d, want 3 fetched + 1 prepended", f.Loaded())
+	}
+
+	// The next page starts where it would have without the prepend: rows
+	// 3-5 of the old sequence, not a duplicate of anything on screen.
+	l.Intersect("[data-shuttle-sentinel]")
+	patches = strings.Join(l.Patches(), "\n")
+	for _, want := range []string{"post-3", "post-4", "post-5"} {
+		if !strings.Contains(patches, want) {
+			t.Errorf("%q missing from the next page", want)
+		}
+	}
+	if got := strings.Count(patches, ">post-2<"); got > 1 {
+		t.Errorf("post-2 was served twice - the prepend did not shift the offset")
+	}
+	if !f.Done() {
+		t.Error("the feed does not know it reached the end")
+	}
+}
+
+// TestPrependFillsAnEmptyFeed: the Empty note has to give way to the row.
+func TestPrependFillsAnEmptyFeed(t *testing.T) {
+	f := &live.Feed[string]{
+		Load:     loadPosts(nil, 0),
+		Item:     func(s string) templ.Component { return live.Text(s) },
+		PageSize: 3,
+		Empty:    "Nothing yet.",
+	}
+	l := shuttle.Test(t, f)
+	l.Assert().TextContains("[data-shuttle-feed-end]", "Nothing yet.")
+
+	if err := f.Do(func(ctx context.Context) error {
+		return f.Prepend(ctx, "post-new")
+	}); err != nil {
+		t.Fatalf("prepend: %v", err)
+	}
+	l.Settle()
+
+	if !strings.Contains(strings.Join(l.Patches(), "\n"), "post-new") {
+		t.Fatal("the prepended row was not streamed")
+	}
+	l.Assert().Missing("[data-shuttle-feed-end]")
+	if f.Loaded() != 1 {
+		t.Errorf("Loaded() = %d, want 1", f.Loaded())
+	}
+}
+
+// loadByCursor paginates by key and ignores Offset entirely, the way a
+// database seeking on an indexed column does. Next is the index of the row
+// after this page, "" on the last.
+func loadByCursor(all []string) func(context.Context, live.Query) (live.Page[string], error) {
+	return func(_ context.Context, q live.Query) (live.Page[string], error) {
+		at := 0
+		if q.Cursor != "" {
+			at, _ = strconv.Atoi(q.Cursor)
+		}
+		if at >= len(all) {
+			return live.Page[string]{Total: -1}, nil
+		}
+		end := min(at+q.Limit, len(all))
+		p := live.Page[string]{Rows: all[at:end], Total: -1}
+		if end < len(all) {
+			p.Next = strconv.Itoa(end)
+		}
+		return p, nil
+	}
+}
+
+// TestFeedWalksAKeysetSource. Setting Page.Next is the whole opt-in: the
+// feed carries it back as Query.Cursor, is not exhausted while it is set,
+// and stops the moment the source leaves it empty.
+func TestFeedWalksAKeysetSource(t *testing.T) {
+	f := &live.Feed[string]{
+		Load:     loadByCursor(posts(7)),
+		Item:     func(s string) templ.Component { return live.Text(s) },
+		PageSize: 3,
+	}
+	l := shuttle.Test(t, f)
+
+	for range 2 {
+		l.Intersect("[data-shuttle-sentinel]")
+	}
+	if f.Loaded() != 7 {
+		t.Fatalf("Loaded() = %d, want all 7", f.Loaded())
+	}
+	if !f.Done() {
+		t.Error("the feed does not know the cursor ran out")
+	}
+	l.Assert().Missing("[data-shuttle-sentinel]")
+
+	patches := strings.Join(l.Patches(), "\n")
+	for _, want := range []string{"post-3", "post-6"} {
+		if !strings.Contains(patches, want) {
+			t.Errorf("%q never arrived", want)
+		}
+	}
+}
+
+// TestPrependLeavesAKeysetCursorAlone: a cursor points into the sequence
+// below, so a row arriving at the head must not disturb it - no
+// compensation, no skipped rows.
+func TestPrependLeavesAKeysetCursorAlone(t *testing.T) {
+	f := &live.Feed[string]{
+		Load:     loadByCursor(posts(5)),
+		Item:     func(s string) templ.Component { return live.Text(s) },
+		PageSize: 3,
+	}
+	l := shuttle.Test(t, f)
+
+	if err := f.Do(func(ctx context.Context) error {
+		return f.Prepend(ctx, "post-new")
+	}); err != nil {
+		t.Fatalf("prepend: %v", err)
+	}
+	l.Settle()
+	l.Intersect("[data-shuttle-sentinel]")
+
+	patches := strings.Join(l.Patches(), "\n")
+	for _, want := range []string{"post-3", "post-4"} {
+		if !strings.Contains(patches, want) {
+			t.Errorf("%q was skipped after a prepend", want)
+		}
+	}
+	if !f.Done() {
+		t.Error("the feed did not finish")
 	}
 }

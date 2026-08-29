@@ -427,6 +427,18 @@ A hardening pass over the kit fixed a cluster of edge cases, each with a pinning
   infinite sentinel loop), advances its cursor by what was actually appended (a mid-stream failure
   no longer double-appends on retry), and a first-page failure retried lands in `first` as well as
   the stream, so `Held()` and a fresh full render stay truthful.
+- **`Feed.Prepend` and keyset pagination** arrived together because prepend's duplicate problem is
+  what keyset solves. `Prepend(ctx, row)` streams one row to the top under a *negative* key, so it
+  can never collide with the appended keys counting up from zero; its contract is that the source
+  now serves the row at its head, which is what lets the feed shift an offset source's next fetch
+  by the prepend count (or nothing gets served twice) while leaving a keyset cursor alone (it
+  points into the sequence below). A source opts into keyset by setting `Page.Next`; the feed
+  carries it back as `Query.Cursor`, is not exhausted while it is set - checked *after* the
+  empty-page guard, so a source contradicting itself (Next with no rows) still cannot loop - and
+  only advances the cursor when the whole page reached the container, so a partial append retries
+  the same page. `Table` ignores both fields. `Live.Settle` was exported for exactly these tests:
+  work caused outside the kit's helpers (a `Do`-wrapped `Prepend`) needs settling before
+  assertions.
 
 **The table holds its shape**, because one that resizes on every sort, page and keystroke throws the
 page around under the cursor. Measured before and after on the same five steps — initial, sorted,
