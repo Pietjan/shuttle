@@ -10,6 +10,12 @@ import (
 // Informer is implemented by components that receive messages from pub/sub,
 // from a timer, or from an application goroutine. HandleInfo runs on the
 // session's own goroutine, so it can touch component state directly.
+//
+// Treat the message as a trigger, not as the data: delivery is
+// at-most-once, so a component whose only copy of the truth is the
+// messages it has seen shows a hole for every one it missed - see the
+// contract on [Broker]. The durable pattern reads its state back from
+// somewhere it can always re-fetch, and uses HandleInfo to know when.
 type Informer interface {
 	HandleInfo(ctx context.Context, msg any) error
 }

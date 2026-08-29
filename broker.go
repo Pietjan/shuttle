@@ -13,6 +13,31 @@ import (
 // Publish must not block on delivery, and deliver is called on whichever
 // goroutine the broker chooses - a subscriber hands the message to its own
 // session rather than acting on it directly.
+//
+// # The contract is the distributed one, even in memory
+//
+// Write components against what any broker can promise, not against what
+// the in-memory one happens to do - the gap between the two is exactly
+// what breaks the day a real broker is swapped in, and by then the
+// components relying on it are everywhere. Concretely:
+//
+//   - Delivery is at-most-once and asynchronous in principle. A message can
+//     be lost to a network partition, and a subscriber can miss everything
+//     published while its node - or its page, across a reconnect - was
+//     away. So treat a message as an invalidation, not as the data: derive
+//     the view from state that can be re-fetched, and let HandleInfo
+//     trigger the re-fetch. A component that accumulates messages as its
+//     only copy of the truth is quietly betting on delivery guarantees this
+//     interface never made.
+//   - Ordering is only what the transport gives. The in-memory broker
+//     delivers in publish order because it is one process; nothing here
+//     promises that across nodes, or across topics anywhere.
+//   - Messages are values that may cross a process boundary. In one
+//     process a published pointer works - and shares live memory between
+//     sessions, each mutating it on its own goroutine. Publish plain data
+//     a distributed broker could serialize (and PresenceEvent, which
+//     shuttle publishes itself, is exactly that shape); a pointer meant as
+//     shared state is a race today and a silent drop tomorrow.
 type Broker interface {
 	// Publish sends msg to everything subscribed to topic.
 	Publish(ctx context.Context, topic string, msg any) error

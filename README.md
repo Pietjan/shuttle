@@ -447,6 +447,26 @@ closes, `Handler.Grace` later evicts the session, and returning to that tab relo
 loses what it held. Trading that away to reclaim a connection is only reasonable on HTTP/1.1 with
 `Grace` raised to cover how long a tab might sit in the background.
 
+## One node is the supported deployment
+
+Sessions live in one process's memory and never migrate — the component tree is closures over live
+Go values, and serializing it is the wire-state model this design rejected on purpose. So the
+supported shape is a single node behind TLS with HTTP/2, and it goes further than it sounds: the
+session registry's cap of 10,000 live pages is the memory ceiling, not a performance one, and the
+budgets under [Sessions, identity and abuse](#sessions-identity-and-abuse) bound what each of
+those pages can do.
+
+Running replicas anyway means two things. For *availability*, it works today with session
+affinity — every request a page makes, stream included, must reach the node that holds its
+session, and a node's death is recovered by the same reload path a deploy uses, with state
+remounting from the URL. As *one logical app* — rooms and presence spanning nodes — it
+additionally needs a `Broker` backed by NATS or Redis, which is a small package the interface was
+designed for but which does not exist yet, plus a shared roster, which today is in-process even
+with a shared broker. Write components against the contract documented on `Broker` either way:
+delivery is at-most-once and messages are values, and a component that only works because the
+in-memory broker is synchronous and shares pointers is a component that breaks the day the real
+broker arrives.
+
 ## Connection state
 
 The page puts its connection state on `<html>`, so you can style it:

@@ -152,6 +152,27 @@ This was found by the race detector at about 5% of runs, in tests that called `c
 test files broke the rule, which is the argument for the note living on the methods rather than only
 here.
 
+### Multi-node: decided, deliberately not built
+
+The scale-out design was worked through and the conclusion is that only one piece of it is
+retrofit-hostile, so only that piece was done. The rest is additive when a deployment actually
+needs it, and building it earlier would be speculation:
+
+- **Sessions never migrate.** The tree is closures over live Go values; serializing it is the
+  Livewire model this project rejected on day one. Multi-node means routing requests to the owning
+  node - LB stickiness, or fly-replay-style forwarding off a session→node map - and failover stays
+  what a deploy already is: the page reloads and remounts from its URL.
+- **A distributed Broker is a small additive package** (NATS or Redis behind the existing
+  interface). Presence across nodes becomes an optional interface the handler type-asserts on the
+  broker, so the memory broker keeps today's behaviour untouched.
+- **The retrofit-hostile piece is the contract, not the code** - so it is written down now, on
+  `Broker` and `Informer`. The in-memory broker accidentally over-promises: synchronous, ordered,
+  guaranteed, and able to share live pointers between sessions. Components written against those
+  accidental properties break the day a real broker arrives, and every day they aren't documented
+  more such components get written. The documented contract is the distributed one: at-most-once,
+  unordered across nodes, messages are serializable values, HandleInfo is an invalidation rather
+  than the data.
+
 ### Pub/sub, timers, presence
 
 `Subscribe` from `Mount`, receive in `HandleInfo` (the `Informer` interface), publish with
