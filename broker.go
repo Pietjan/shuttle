@@ -46,6 +46,35 @@ type Broker interface {
 	Subscribe(topic string, deliver func(msg any)) (func(), error)
 }
 
+// PresenceBroker is a Broker that also holds the presence roster, so
+// [Base.Presence] lists members across every node sharing it. Optional and
+// discovered by type assertion: a Broker without it keeps the roster
+// in-process, which is exactly right for the in-memory broker.
+//
+// Shuttle calls Join and Leave only on a session's first join and last
+// leave of a topic - the per-component refcounting stays local, since a
+// session lives on one node. Implementations must deliver a join to the
+// wire before shuttle's own PresenceEvent for it follows on the same
+// topic, so a component re-rendering on the event reads a roster that
+// already contains the member; publishing both on one ordered connection
+// is the usual way.
+//
+// Members returns the merged roster, ordered by tag. No error: a
+// distributed implementation answers from a local mirror, because this is
+// read during renders and a render must not wait on a network round trip.
+type PresenceBroker interface {
+	Broker
+
+	// Join records member on topic's roster.
+	Join(ctx context.Context, topic string, member Member) error
+
+	// Leave removes the member with tag from topic's roster.
+	Leave(ctx context.Context, topic, tag string) error
+
+	// Members returns topic's roster across every node, ordered by tag.
+	Members(topic string) []Member
+}
+
 // memoryBroker is the single-process Broker.
 type memoryBroker struct {
 	mu     sync.RWMutex

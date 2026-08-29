@@ -511,12 +511,14 @@ natsbroker.Register(RoomMessage{})   // once per message type, on every node
 Messages cross the wire as gob, so `HandleInfo` sees the same concrete type the publisher sent —
 that is what `Register` is for, and an unregistered type fails at `Publish` on your machine rather
 than in production. Every delivery goes through the wire, the publisher's own subscribers
-included, so one node behaves exactly like five. What the broker does not distribute is the
-presence *roster*: join and leave events cross nodes, but `Presence` lists what this node has
-seen — a shared roster is a later piece. Write components against the contract documented on
-`Broker` either way: delivery is at-most-once and messages are values, and a component that only
-works because the in-memory broker is synchronous and shares pointers is a component that breaks
-the day it runs on two nodes.
+included, so one node behaves exactly like five. The presence *roster* crosses too: the broker is
+a `PresenceBroker`, so `Presence` lists members on every node — kept as a gossip mirror on each
+one, because rosters are read during renders and a render must never wait on the network, and a
+crashed node's members age out on their own once its heartbeats stop. Call the broker's `Close` on
+shutdown to stop the gossip. Write components against the contract documented on `Broker` either
+way: delivery is at-most-once and messages are values, and a component that only works because the
+in-memory broker is synchronous and shares pointers is a component that breaks the day it runs on
+two nodes.
 
 ## Connection state
 

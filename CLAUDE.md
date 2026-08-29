@@ -174,8 +174,20 @@ needs it, and building it earlier would be speculation:
   like everything else, and shuttle's `Join` subscribes-before-announcing so a joiner hears its own
   arrival - without the round trip that promise quietly breaks, which
   `TestUnsubscribeStopsDeliveryAndTopicsAreOpaque` found by losing a message. Tests run a real
-  embedded nats-server, no Docker. Presence across nodes remains the later piece: an optional
-  interface the handler type-asserts on the broker.
+  embedded nats-server, no Docker.
+- **The roster crosses nodes through `PresenceBroker`**, the optional interface `Base.Join`,
+  `Leave`-on-unmount and `Base.Presence` type-assert on the session's broker. The division of
+  labour is deliberate: per-component refcounting stays in the local `presence` struct (a session
+  lives on one node), and the broker hears only a session's first join and last leave - each
+  *before* the PresenceEvent that announces it, so a component re-rendering on the event reads a
+  roster that already holds the member; `TestAPresenceBrokerOwnsTheRoster` pins the exact order.
+  The NATS implementation is a gossip mirror rather than shared storage, because `Members` is read
+  during renders and must never wait on the network: immediate deltas (per-connection ordering is
+  what sequences a delta before its event), heartbeat state every `PresenceInterval` as repair and
+  liveness, a sync request on startup so a fresh node's mirror fills in one round trip, and a
+  crashed node's members age out at 3.5 intervals - self-cleaning ghost sessions need anyway,
+  pinned by `TestACrashedNodesMembersAgeOut`. `Broker.Close` stops the gossip; a broker used only
+  for messages never starts it.
 - **The retrofit-hostile piece is the contract, not the code** - so it is written down now, on
   `Broker` and `Informer`. The in-memory broker accidentally over-promises: synchronous, ordered,
   guaranteed, and able to share live pointers between sessions. Components written against those

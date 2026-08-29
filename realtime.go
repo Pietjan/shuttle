@@ -263,8 +263,26 @@ func (b *Base) Join(ctx context.Context, topic string, meta any) error {
 
 	sess := b.n.sess
 	member, fresh := sess.presence().join(topic, sess.Tag(), meta)
+	// A broker that holds the roster is told on the first join only - the
+	// refcounting above is local on purpose, since a session lives on one
+	// node - and told *before* the PresenceEvent below goes out, so a
+	// component re-rendering on the event reads a roster that already
+	// holds the member.
+	if fresh {
+		if pb, ok := sess.broker.(PresenceBroker); ok {
+			if err := pb.Join(ctx, topic, member); err != nil {
+				sess.presence().leave(topic, sess.Tag())
+				return err
+			}
+		}
+	}
 	b.n.onClose(func() {
 		if m, ok := sess.presence().leave(topic, sess.Tag()); ok {
+			if pb, ok := sess.broker.(PresenceBroker); ok {
+				if err := pb.Leave(context.Background(), topic, sess.Tag()); err != nil {
+					sess.fail("presence leave", err)
+				}
+			}
 			_ = sess.broker.Publish(context.Background(), topic,
 				PresenceEvent{Topic: topic, Member: m, Joined: false})
 		}
@@ -277,10 +295,15 @@ func (b *Base) Join(ctx context.Context, topic string, meta any) error {
 		PresenceEvent{Topic: topic, Member: member, Joined: true})
 }
 
-// Presence returns who is currently on a topic, ordered by member tag.
+// Presence returns who is currently on a topic, ordered by member tag -
+// across every node, when the Broker is a [PresenceBroker]; otherwise this
+// process's roster, which on one node is the same thing.
 func (b *Base) Presence(topic string) []Member {
 	if b.n == nil {
 		return nil
+	}
+	if pb, ok := b.n.sess.broker.(PresenceBroker); ok {
+		return pb.Members(topic)
 	}
 	return b.n.sess.presence().list(topic)
 }

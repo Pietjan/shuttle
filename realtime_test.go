@@ -631,3 +631,84 @@ func TestAnUnchangedRenderIsNotPushed(t *testing.T) {
 		t.Errorf("a changed render produced %d patches, want 1", len(got))
 	}
 }
+
+// rosterBroker fakes a PresenceBroker: the in-memory broker plus a recorded
+// roster, so the delegation rules are checkable without a wire.
+type rosterBroker struct {
+	Broker
+	mu     sync.Mutex
+	joins  []string
+	leaves []string
+	events []string // interleaved with joins/leaves, to check ordering
+}
+
+func (r *rosterBroker) Join(_ context.Context, topic string, m Member) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.joins = append(r.joins, topic+":"+fmt.Sprint(m.Meta))
+	r.events = append(r.events, "join")
+	return nil
+}
+
+func (r *rosterBroker) Leave(_ context.Context, topic, tag string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.leaves = append(r.leaves, topic+":"+tag)
+	r.events = append(r.events, "leave")
+	return nil
+}
+
+func (r *rosterBroker) Members(string) []Member {
+	return []Member{{Tag: "far-away", Meta: "remote"}}
+}
+
+func (r *rosterBroker) Publish(ctx context.Context, topic string, msg any) error {
+	if _, ok := msg.(PresenceEvent); ok {
+		r.mu.Lock()
+		r.events = append(r.events, "event")
+		r.mu.Unlock()
+	}
+	return r.Broker.Publish(ctx, topic, msg)
+}
+
+// TestAPresenceBrokerOwnsTheRoster pins the delegation rules: the broker
+// hears about a session's first join and last leave only - refcounting
+// stays local - each before the PresenceEvent that announces it, and
+// Presence reads the broker's merged roster rather than the local one.
+func TestAPresenceBrokerOwnsTheRoster(t *testing.T) {
+	rb := &rosterBroker{Broker: NewMemoryBroker()}
+	r := &room{Topic: "lobby", Who: "ada"}
+	sess := newSessionWith("a", r, rb, newPresence(), nil, &counters{})
+
+	if err := sess.call(context.Background(), func() error {
+		if err := r.Mount(context.Background(), nil); err != nil {
+			return err
+		}
+		// A second component of the same session joins the same topic.
+		return r.Join(context.Background(), "lobby", "ada-again")
+	}); err != nil {
+		t.Fatalf("mount: %v", err)
+	}
+
+	rb.mu.Lock()
+	joins := fmt.Sprint(rb.joins)
+	rb.mu.Unlock()
+	if joins != "[lobby:ada]" {
+		t.Errorf("broker joins = %v, want only the session's first", joins)
+	}
+
+	if got := fmt.Sprint(r.Presence("lobby")); !strings.Contains(got, "far-away") {
+		t.Errorf("Presence() = %v, want the broker's merged roster", got)
+	}
+
+	sess.close(context.Background())
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	if fmt.Sprint(rb.leaves) != "[lobby:"+sess.Tag()+"]" {
+		t.Errorf("broker leaves = %v, want exactly one at the last leave", rb.leaves)
+	}
+	// join before its event, leave before its event.
+	if got := fmt.Sprint(rb.events); got != "[join event leave event]" {
+		t.Errorf("order = %v, want each roster write before its announcement", got)
+	}
+}

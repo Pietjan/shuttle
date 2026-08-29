@@ -25,12 +25,16 @@
 // receiving one (a node running older code) is reported to the handler and
 // dropped.
 //
-// # What this does not distribute
+// # The roster crosses nodes too
 //
-// Presence. The roster is in-process per node even with a shared broker:
-// join and leave events cross nodes, but [shuttle.Base.Presence] lists
-// only the members this node has seen join since it subscribed. A shared
-// roster is a later, separate piece.
+// Broker is a [shuttle.PresenceBroker]: with it in place,
+// [shuttle.Base.Presence] lists members across every node. The roster is a
+// gossip mirror - every node keeps a full copy, kept honest by immediate
+// deltas, heartbeat state, and a sync on startup - so reading it never
+// waits on the network, and a crashed node's members age out on their own
+// once its heartbeats stop. See presence.go. A node's [shuttle.Member.Meta]
+// crosses the wire like any message, so non-basic Meta types need
+// [Register] too. Call [Broker.Close] on shutdown to stop the gossip.
 package nats
 
 import (
@@ -40,6 +44,8 @@ import (
 	"encoding/gob"
 	"fmt"
 	"log/slog"
+	"sync"
+	"time"
 
 	"github.com/nats-io/nats.go"
 	"github.com/pietjan/shuttle"
@@ -67,26 +73,49 @@ func Prefix(p string) Option { return func(b *Broker) { b.prefix = p } }
 // running older code than its publisher. Defaults to slog.Default().
 func Logger(l *slog.Logger) Option { return func(b *Broker) { b.log = l } }
 
-// Broker is a [shuttle.Broker] over a NATS connection.
+// Broker is a [shuttle.Broker] over a NATS connection. It is also a
+// [shuttle.PresenceBroker]: with it in place, Base.Presence lists members
+// across every node - see presence.go for how the roster stays honest.
 type Broker struct {
 	nc     *nats.Conn
 	prefix string
 	log    *slog.Logger
+
+	// The presence gossip, set up lazily on first use so a Broker used
+	// only for messages pays nothing for it.
+	node         string
+	interval     time.Duration
+	roster       *mirror
+	stop         chan struct{}
+	presenceSubs []*nats.Subscription
+	presenceOnce sync.Once
+	presenceErr  error
+	closeOnce    sync.Once
 }
 
 // New returns a Broker over nc. The connection is the application's: it
 // owns connecting, reconnect options and closing, and one connection can
-// back many handlers.
+// back many handlers. Call [Broker.Close] on shutdown if presence was
+// used.
 //
 //	nc, _ := nats.Connect(natsURL)
 //	handler.Broker = natsbroker.New(nc)
 func New(nc *nats.Conn, opts ...Option) *Broker {
-	b := &Broker{nc: nc, prefix: "shuttle", log: slog.Default()}
+	b := &Broker{
+		nc:       nc,
+		prefix:   "shuttle",
+		log:      slog.Default(),
+		node:     nodeID(),
+		interval: DefaultPresenceInterval,
+	}
 	for _, opt := range opts {
 		opt(b)
 	}
 	return b
 }
+
+// The compile-time promises: a Broker, and one that owns the roster.
+var _ shuttle.PresenceBroker = (*Broker)(nil)
 
 // envelope carries the message as a gob interface value, which is what
 // brings the concrete type back out on the far side.

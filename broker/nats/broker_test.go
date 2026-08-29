@@ -275,3 +275,140 @@ func TestTwoHandlersHearEachOther(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// eventually polls cond against a real wire, where "it arrived" has no
+// deadline the test can subscribe to.
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+func tags(members []shuttle.Member) string {
+	out := make([]string, len(members))
+	for i, m := range members {
+		out[i] = m.Tag
+	}
+	return strings.Join(out, ",")
+}
+
+// TestTheRosterSpansNodes: joins on any node appear in every node's
+// Members - including a node that started after the join, whose sync
+// request fills its mirror without waiting a heartbeat interval.
+func TestTheRosterSpansNodes(t *testing.T) {
+	srv := cluster(t)
+	a := natsbroker.New(connect(t, srv))
+	t.Cleanup(a.Close)
+
+	if err := a.Join(context.Background(), "lobby", shuttle.Member{Tag: "aa", Meta: "ada"}); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	// The joiner's own read is synchronous, like the in-memory roster.
+	if got := tags(a.Members("lobby")); got != "aa" {
+		t.Fatalf("own roster = %q immediately after joining, want aa", got)
+	}
+
+	// A node arriving later - its first read may race the sync answer, but
+	// only briefly, not a heartbeat.
+	b := natsbroker.New(connect(t, srv))
+	t.Cleanup(b.Close)
+	if err := b.Join(context.Background(), "lobby", shuttle.Member{Tag: "bb", Meta: "bob"}); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+
+	eventually(t, "the late node to see both", func() bool { return tags(b.Members("lobby")) == "aa,bb" })
+	eventually(t, "the first node to see both", func() bool { return tags(a.Members("lobby")) == "aa,bb" })
+
+	if err := a.Leave(context.Background(), "lobby", "aa"); err != nil {
+		t.Fatalf("leave: %v", err)
+	}
+	eventually(t, "the leave to reach the other node", func() bool { return tags(b.Members("lobby")) == "bb" })
+}
+
+// TestACrashedNodesMembersAgeOut. Nothing stores the roster, so a node
+// that dies without leaving takes its members with it once its heartbeats
+// stop - the self-cleaning a crashed node's ghost sessions need.
+func TestACrashedNodesMembersAgeOut(t *testing.T) {
+	srv := cluster(t)
+	fast := natsbroker.PresenceInterval(30 * time.Millisecond)
+
+	dying := natsbroker.New(connect(t, srv), fast)
+	watcher := natsbroker.New(connect(t, srv), fast)
+	t.Cleanup(watcher.Close)
+
+	if err := dying.Join(context.Background(), "lobby", shuttle.Member{Tag: "dd", Meta: "doomed"}); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	if err := watcher.Join(context.Background(), "lobby", shuttle.Member{Tag: "ww", Meta: "here"}); err != nil {
+		t.Fatalf("join: %v", err)
+	}
+	eventually(t, "both on the roster", func() bool { return tags(watcher.Members("lobby")) == "dd,ww" })
+
+	// The node dies: no Leave, heartbeats just stop.
+	dying.Close()
+
+	eventually(t, "the dead node's member to age out", func() bool {
+		return tags(watcher.Members("lobby")) == "ww"
+	})
+}
+
+// roomful joins on mount and renders the roster, one per handler in the
+// cross-node test.
+type roomful struct {
+	shuttle.Base
+	Who string
+}
+
+func (r *roomful) Mount(ctx context.Context, _ shuttle.Params) error {
+	return r.Join(ctx, "lobby", r.Who)
+}
+
+func (r *roomful) HandleInfo(context.Context, any) error { return nil }
+
+func (r *roomful) names() string {
+	members := r.Presence("lobby")
+	out := make([]string, len(members))
+	for i, m := range members {
+		out[i] = fmt.Sprint(m.Meta)
+	}
+	return strings.Join(out, ",")
+}
+
+func (r *roomful) Render(ctx context.Context) templ.Component {
+	names := r.names()
+	return templ.ComponentFunc(func(ctx context.Context, w io.Writer) error {
+		_, err := fmt.Fprintf(w, `<p id="who">%s</p>`, templ.EscapeString(names))
+		return err
+	})
+}
+
+// TestPresenceSpansHandlers is the roster end to end: two Handlers on two
+// broker instances, each page's component listing both members through
+// nothing but Base.Presence.
+func TestPresenceSpansHandlers(t *testing.T) {
+	srv := cluster(t)
+
+	page := func(who string) *roomful {
+		r := &roomful{Who: who}
+		h := shuttle.New(func() shuttle.Component { return r })
+		h.Broker = natsbroker.New(connect(t, srv))
+		ts := httptest.NewTestServer(t, h)
+		t.Cleanup(ts.Close)
+		if _, err := ts.Client().Get(ts.URL + "/"); err != nil {
+			t.Fatalf("page: %v", err)
+		}
+		return r
+	}
+
+	ada := page("ada")
+	bob := page("bob")
+
+	eventually(t, "ada to see both", func() bool { return ada.names() == "ada,bob" })
+	eventually(t, "bob to see both", func() bool { return bob.names() == "ada,bob" })
+}
