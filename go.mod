@@ -7,7 +7,7 @@ require (
 	github.com/pietjan/loom v0.0.0-20260802231856-03d8564d5bbf
 	github.com/playwright-community/playwright-go v0.6000.0
 	github.com/starfederation/datastar-go v1.2.2
-	golang.org/x/net v0.57.0
+	golang.org/x/net v0.58.0
 )
 
 require (
@@ -19,8 +19,8 @@ require (
 	github.com/dlclark/regexp2/v2 v2.2.1 // indirect
 	github.com/go-jose/go-jose/v3 v3.0.5 // indirect
 	github.com/go-stack/stack v1.8.1 // indirect
+	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect
+	github.com/stretchr/testify v1.12.1 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 )
-
-replace github.com/pietjan/loom => ../loom

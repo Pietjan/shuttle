@@ -39,6 +39,9 @@ linters:
           - gosec
           # A test's failure is read by a person, not matched on by a caller.
           - err113
+          # The response helpers close their bodies in t.Cleanup, which
+          # bodyclose cannot see.
+          - bodyclose
         path: _test\.go
       # The examples are programs that report to a human and exit: their
       # errors reach log.Fatal, never a caller, so sentinels to match on

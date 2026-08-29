@@ -92,7 +92,8 @@ type Feed[T any] struct {
 
 // Mount loads the first page.
 func (f *Feed[T]) Mount(ctx context.Context, _ shuttle.Params) error {
-	return f.reload(ctx)
+	f.reload(ctx)
+	return nil
 }
 
 // Loaded reports how many rows the reader has been given so far. The rows
@@ -120,26 +121,25 @@ func (f *Feed[T]) Reset(ctx context.Context) error {
 	if err := s.Clear(ctx); err != nil {
 		return err
 	}
-	if err := f.reload(ctx); err != nil {
-		return err
-	}
+	f.reload(ctx)
 	_, err := f.stream(ctx, f.first.Rows, 0)
 	return err
 }
 
-// reload fetches the first page into the component's own state.
-func (f *Feed[T]) reload(ctx context.Context) error {
+// reload fetches the first page into the component's own state. A failing
+// fetch is the feed's to report (f.failed), never an error for the caller:
+// the page must render around it, so there is nothing to return.
+func (f *Feed[T]) reload(ctx context.Context) {
 	f.failed, f.sent, f.done = nil, 0, false
 
 	page, err := f.fetch(ctx, 0)
 	if err != nil {
 		f.first, f.failed = Page[T]{}, err
-		return nil
+		return
 	}
 	f.first = page
 	f.sent = len(page.Rows)
 	f.done = f.exhausted(page)
-	return nil
 }
 
 // more is what the sentinel calls: the next page, streamed.

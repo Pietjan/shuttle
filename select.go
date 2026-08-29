@@ -1,6 +1,7 @@
 package shuttle
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -47,11 +48,15 @@ type attrCond struct {
 	exact bool
 }
 
+// errBadSelector is the static root of every parse refusal, so a caller
+// can errors.Is its way to "the selector was wrong, not the page".
+var errBadSelector = errors.New("shuttle: bad selector")
+
 // parseSelector reads a selector, returning an error for anything it does
 // not fully understand.
 func parseSelector(s string) (selector, error) {
 	if strings.TrimSpace(s) == "" {
-		return nil, fmt.Errorf("shuttle: empty selector")
+		return nil, fmt.Errorf("%w: empty", errBadSelector)
 	}
 	var sel selector
 	for _, part := range splitSteps(s) {
@@ -115,14 +120,14 @@ func parseStep(s string) (step, error) {
 		}
 		end := closingBracket(s, open)
 		if end < 0 {
-			return st, fmt.Errorf("shuttle: selector %q: unterminated [", orig)
+			return st, fmt.Errorf("%w %q: unterminated [", errBadSelector, orig)
 		}
 
 		cond := s[open+1 : end]
 		if before, after, ok := strings.Cut(cond, "="); ok {
 			key := strings.TrimSpace(before)
 			if len(key) > 0 && strings.ContainsAny(key[len(key)-1:], "^$*~|") {
-				return st, fmt.Errorf("shuttle: selector %q: attribute operators are not supported, only [k] and [k=v]", orig)
+				return st, fmt.Errorf("%w %q: attribute operators are not supported, only [k] and [k=v]", errBadSelector, orig)
 			}
 			st.attrs = append(st.attrs, attrCond{
 				key:   key,
@@ -136,7 +141,7 @@ func parseStep(s string) (step, error) {
 	}
 
 	if i := strings.IndexAny(s, ">+~,:*()"); i >= 0 {
-		return st, fmt.Errorf("shuttle: selector %q: %q is not supported - tags, #id, .class, [attr] and descendants only", orig, s[i])
+		return st, fmt.Errorf("%w %q: %q is not supported - tags, #id, .class, [attr] and descendants only", errBadSelector, orig, s[i])
 	}
 
 	for s != "" {
@@ -145,31 +150,31 @@ func parseStep(s string) (step, error) {
 			var id string
 			id, s = scanName(s[1:])
 			if id == "" {
-				return st, fmt.Errorf("shuttle: selector %q: # with no id", orig)
+				return st, fmt.Errorf("%w %q: # with no id", errBadSelector, orig)
 			}
 			if st.id != "" {
-				return st, fmt.Errorf("shuttle: selector %q: two ids in one step", orig)
+				return st, fmt.Errorf("%w %q: two ids in one step", errBadSelector, orig)
 			}
 			st.id = id
 		case '.':
 			var class string
 			class, s = scanName(s[1:])
 			if class == "" {
-				return st, fmt.Errorf("shuttle: selector %q: . with no class", orig)
+				return st, fmt.Errorf("%w %q: . with no class", errBadSelector, orig)
 			}
 			st.classes = append(st.classes, class)
 		default:
 			var tag string
 			tag, s = scanName(s)
 			if st.tag != "" {
-				return st, fmt.Errorf("shuttle: selector %q: two tags in one step", orig)
+				return st, fmt.Errorf("%w %q: two tags in one step", errBadSelector, orig)
 			}
 			st.tag = tag
 		}
 	}
 
 	if st.tag == "" && st.id == "" && len(st.classes) == 0 && len(st.attrs) == 0 {
-		return st, fmt.Errorf("shuttle: selector %q: empty step", orig)
+		return st, fmt.Errorf("%w %q: empty step", errBadSelector, orig)
 	}
 	return st, nil
 }

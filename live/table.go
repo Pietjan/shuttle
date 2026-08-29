@@ -155,18 +155,18 @@ func (t *Table[T]) hiddenKeys() []string {
 }
 
 // toggleColumn shows or hides one column.
-func (t *Table[T]) toggleColumn(ctx context.Context, key string) error {
+func (t *Table[T]) toggleColumn(ctx context.Context, key string) {
 	if t.hidden == nil {
 		t.hidden = map[string]bool{}
 	}
 	if t.hidden[key] {
 		delete(t.hidden, key)
-		return nil
+		return
 	}
 	// Never the last one: a table with no columns has no picker to get them
 	// back from.
 	if len(t.Visible()) <= 1 {
-		return nil
+		return
 	}
 	t.hidden[key] = true
 
@@ -177,9 +177,8 @@ func (t *Table[T]) toggleColumn(ctx context.Context, key string) error {
 	if t.query.Sort == key {
 		t.query.Sort, t.query.Desc = "", false
 		t.query.Offset = 0
-		return t.reload(ctx)
+		t.reload(ctx)
 	}
-	return nil
 }
 
 // Rows returns the current page's rows.
@@ -246,7 +245,8 @@ func (t *Table[T]) HandleParams(ctx context.Context, p shuttle.Params) error {
 		_ = t.PatchSignal("filter", t.query.Filter)
 	}
 
-	return t.reload(ctx)
+	t.reload(ctx)
+	return nil
 }
 
 // QueryParams puts the view back into the URL after every render.
@@ -279,12 +279,14 @@ func (t *Table[T]) pageNumber() int {
 	return t.query.Offset/t.query.Limit + 1
 }
 
-// reload asks the data source for the current view.
-func (t *Table[T]) reload(ctx context.Context) error {
+// reload asks the data source for the current view. A failing Load is the
+// table's to report (t.failed), never an error for the caller: the page
+// must render around it, so there is nothing to return.
+func (t *Table[T]) reload(ctx context.Context) {
 	t.failed = nil
 	if t.Load == nil {
 		t.page = Page[T]{}
-		return nil
+		return
 	}
 	if t.query.Limit <= 0 {
 		t.query.Limit = t.limit()
@@ -294,7 +296,7 @@ func (t *Table[T]) reload(ctx context.Context) error {
 	if err != nil {
 		// A failed load is the table's to report, not the page's to die of.
 		t.page, t.failed = Page[T]{}, err
-		return nil
+		return
 	}
 
 	// An offset past the end - ?page=99 in a shared link, a filter that
@@ -308,12 +310,11 @@ func (t *Table[T]) reload(ctx context.Context) error {
 		t.query.Offset = last
 		if page, err = t.Load(ctx, t.query); err != nil {
 			t.page, t.failed = Page[T]{}, err
-			return nil
+			return
 		}
 	}
 
 	t.page = page
-	return nil
 }
 
 // filter re-reads the search field and returns to the first page, because
@@ -331,7 +332,8 @@ func (t *Table[T]) filter(ctx context.Context) error {
 
 	t.query.Filter = f.Filter
 	t.query.Offset = 0
-	return t.reload(ctx)
+	t.reload(ctx)
+	return nil
 }
 
 // sortBy toggles direction when the same column is clicked again.
@@ -342,7 +344,7 @@ func (t *Table[T]) filter(ctx context.Context) error {
 // nothing else on a table un-sorts it, so without this a click on a heading
 // is a decision you cannot undo - and the order the source chose, which is
 // often the meaningful one, becomes unreachable for the rest of the session.
-func (t *Table[T]) sortBy(ctx context.Context, key string) error {
+func (t *Table[T]) sortBy(ctx context.Context, key string) {
 	switch {
 	case t.query.Sort != key:
 		t.query.Sort, t.query.Desc = key, false
@@ -352,7 +354,7 @@ func (t *Table[T]) sortBy(ctx context.Context, key string) error {
 		t.query.Sort, t.query.Desc = "", false
 	}
 	t.query.Offset = 0
-	return t.reload(ctx)
+	t.reload(ctx)
 }
 
 // HasNext reports whether a further page exists.
@@ -464,7 +466,8 @@ func (t *Table[T]) header(ctx context.Context, col Column[T]) templ.Component {
 		// clicked, not a control that happens to sit in one.
 		button.Class("-mx-2 gap-1 text-xs font-semibold uppercase tracking-wide -inset-x-[2px] text-base-500 dark:text-base-400"),
 		shuttle.OnClick(ctx, button.Attr, func(actx context.Context) error {
-			return t.sortBy(actx, key)
+			t.sortBy(actx, key)
+			return nil
 		}),
 	)
 	return with(table.Column(head...), with(sorter, text(col.Title), t.sortIcon(col)))
@@ -574,7 +577,7 @@ func (t *Table[T]) chooser(ctx context.Context) templ.Component {
 			options = append(options, dropdown.Attr("aria-disabled", "true"))
 		} else {
 			options = append(options, shuttle.OnClick(ctx, dropdown.Attr,
-				func(actx context.Context) error { return t.toggleColumn(actx, key) }))
+				func(actx context.Context) error { t.toggleColumn(actx, key); return nil }))
 		}
 
 		items = append(items, with(dropdown.ItemButton(options...),
@@ -663,7 +666,8 @@ func (t *Table[T]) pageLink(
 	options := []pagination.Option{
 		marker,
 		shuttle.OnEvent(ctx, pagination.Attr, "click__prevent", func(actx context.Context) error {
-			return t.goTo(actx, page)
+			t.goTo(actx, page)
+			return nil
 		}),
 	}
 	if page == t.pageNumber() {
@@ -692,7 +696,7 @@ func (t *Table[T]) href(page int) string {
 
 // goTo jumps to a page, clamped: the markup a click was sent against may
 // already be a page or two stale.
-func (t *Table[T]) goTo(ctx context.Context, page int) error {
+func (t *Table[T]) goTo(ctx context.Context, page int) {
 	if page < 1 {
 		page = 1
 	}
@@ -700,7 +704,7 @@ func (t *Table[T]) goTo(ctx context.Context, page int) error {
 		page = pages
 	}
 	t.query.Offset = (page - 1) * t.query.Limit
-	return t.reload(ctx)
+	t.reload(ctx)
 }
 
 // pageCount is how many pages there are, or 0 when the source does not say.

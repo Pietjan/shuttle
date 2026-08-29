@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -208,5 +210,44 @@ func TestTwoJoinersOnOnePageLeaveOnce(t *testing.T) {
 	}
 	if got := len(pres.list("lobby")); got != 0 {
 		t.Errorf("roster after last leave: %d members, want 0", got)
+	}
+}
+
+// TestShutdownEndsEverySession: the graceful half of a deploy. Every
+// session is torn down and waited for, the stream ends so the page falls
+// into its reconnect-then-reload path, and a page load after it answers
+// with a refusal rather than a session nothing would ever collect.
+func TestShutdownEndsEverySession(t *testing.T) {
+	h := New(func() Component { return &counter{} })
+	h.Logger = quietLogger()
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	_, sid := getPage(t, srv)
+	getPage(t, srv)
+	stream := openStream(t, srv, sid)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := h.Shutdown(ctx); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+
+	if got := h.sessions.len(); got != 0 {
+		t.Errorf("%d sessions survived shutdown", got)
+	}
+	select {
+	case <-stream.errs:
+	case <-time.After(3 * time.Second):
+		t.Error("the stream outlived shutdown")
+	}
+
+	resp, err := srv.Client().Get(srv.URL + "/")
+	if err != nil {
+		t.Fatalf("page after shutdown: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("page after shutdown: status %d, want 503", resp.StatusCode)
 	}
 }

@@ -553,6 +553,18 @@ handler.CloseOwner(user.ID)         // every tab they left open
 Closing ends the session and its stream; the page reconnects, finds nothing, and reloads — back
 through your middleware, which is now the thing saying no. `Handler.Close(sid)` does one page.
 
+**Shutting down gracefully is `Handler.Shutdown(ctx)`** — every session torn down and waited for,
+components unmounted, timers and subscriptions stopped, and no new sessions started afterwards.
+Call it after your `http.Server`'s own `Shutdown`:
+
+```go
+srv.Shutdown(ctx)      // stop accepting, drain requests
+handler.Shutdown(ctx)  // release what the pages were holding
+```
+
+Connected pages fall into the same reconnect-and-reload path a deploy already uses, so they come
+back on their own once the new process is listening.
+
 **Every request a page makes draws on a per-session budget** — 10/second with a burst of 40 by
 default, `RequestRate` and `RequestBurst` to change it, a negative rate to turn it off. It refills
 continuously rather than resetting, so a page open all day is in the same position as one just

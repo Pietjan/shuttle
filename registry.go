@@ -29,6 +29,9 @@ type registry struct {
 	mu       sync.Mutex
 	sessions map[string]*Session
 	timers   map[string]*time.Timer
+	// closed refuses new sessions once closeAll has run: a session created
+	// after the sweep would be one nothing ever tears down.
+	closed bool
 
 	// grace, attach and max are fields rather than the constants directly
 	// so tests can drive eviction without sleeping for half a minute.
@@ -89,6 +92,10 @@ func (r *registry) create(cmp Component, broker Broker, pres *presence, onError 
 	}
 
 	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil, ErrShutdown
+	}
 	if len(r.sessions) >= r.max {
 		r.mu.Unlock()
 		return nil, ErrTooManySessions
@@ -155,7 +162,10 @@ func (r *registry) hold(id string) {
 	}
 }
 
-// remove evicts a session and unmounts its component.
+// remove evicts a session and unmounts its component. The unmount is begun
+// rather than waited for - remove is what Handler.Close calls, and that is
+// documented as safe from inside an action, where waiting on the session's
+// own goroutine would be waiting on yourself.
 func (r *registry) remove(id string) {
 	r.mu.Lock()
 	s, ok := r.sessions[id]
@@ -167,7 +177,50 @@ func (r *registry) remove(id string) {
 	r.mu.Unlock()
 
 	if ok {
-		s.close(context.Background())
+		s.beginClose(context.Background())
+	}
+}
+
+// closeAll evicts every session and waits for their teardowns, bounded by
+// ctx. It marks the registry closed first, so nothing minted during the
+// sweep can slip past it.
+func (r *registry) closeAll(ctx context.Context) error {
+	r.mu.Lock()
+	r.closed = true
+	live := make([]*Session, 0, len(r.sessions))
+	for _, s := range r.sessions {
+		live = append(live, s)
+	}
+	r.sessions = map[string]*Session{}
+	for id, t := range r.timers {
+		t.Stop()
+		delete(r.timers, id)
+	}
+	r.mu.Unlock()
+
+	// Concurrently: each close waits behind whatever its session is doing,
+	// and ten thousand of those in a row is a shutdown nobody waits out.
+	done := make(chan struct{})
+	go func() {
+		var wg sync.WaitGroup
+		for _, s := range live {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				s.close(ctx)
+			}()
+		}
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		// The teardowns keep running; only the waiting stops. A session
+		// stuck in component code holds its goroutine either way.
+		return ctx.Err()
 	}
 }
 

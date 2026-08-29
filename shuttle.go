@@ -106,9 +106,9 @@ var (
 	// ErrSessionClosed means the session has been evicted.
 	ErrSessionClosed = errors.New("shuttle: session closed")
 
-	// ErrAlreadyAttached means a second stream tried to attach to a
-	// session that already has one. There is one stream per page.
-	ErrAlreadyAttached = errors.New("shuttle: session already attached")
+	// ErrShutdown means the handler has been shut down and starts no new
+	// sessions.
+	ErrShutdown = errors.New("shuttle: handler is shut down")
 
 	// ErrNotMounted means a Base method was called on a component that no
 	// session owns - usually a zero-value component in a unit test.

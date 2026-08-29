@@ -9,7 +9,10 @@ Livewire). They are separate modules on purpose: Loom's components add no script
 whatever you layer on top is the only JavaScript on the page — Shuttle is that layer, and keeping
 it separate means Loom users who don't want it don't pay for it.
 
-Sibling to Loom on disk; wired with a `replace` directive, not a submodule.
+Sibling to Loom on disk, but wired through the **published** module, not a `replace` directive:
+anyone can `go get` this, and CI builds it the way a consumer would. The consequence to remember
+when changing both repos together: loom changes must be pushed (and `go get
+github.com/pietjan/loom@latest` run here) before shuttle can see them.
 
 ## Settled decisions
 
@@ -718,6 +721,14 @@ the session rather than the component, because component fields belong to the se
 `CloseOwner` runs on a request's. `CloseOwner("")` matches nothing, or one component forgetting to
 call `SetOwner` would make every logout global.
 
+**Shutting the process down needs `Handler.Shutdown(ctx)`.** It ends every session and waits for
+their teardowns, bounded by ctx, and refuses new sessions afterwards (`ErrShutdown` → 503); a
+connected page's stream ends and its reconnect lands in `tellToReload`, the same hand-off a deploy
+already relies on. Call it after `http.Server.Shutdown`, the way that type orders Close after
+Shutdown. The waiting split matters and is why `beginClose`/`close` are two methods: eviction and
+`Handler.Close` must *not* wait (Close is documented safe from inside an action, where waiting on
+the session's own goroutine is waiting on yourself), while Shutdown and the testing kit must.
+
 ### Unmount tears down, and nothing patches a dead component
 
 Found from a console error - `PatchElementsNoTargetsFound` - once navigation started unmounting
@@ -991,6 +1002,15 @@ Four things about the setup, each of which cost a run to find:
 **These replace prose, and they earned it on the first run**: the morph note in this file was wrong
 and a test said so. What belongs here is why a decision was made; what belongs there is whether it
 still holds.
+
+## CI
+
+`.github/workflows/ci.yml`, same shape as toto's: unit tests with `-race` on ubuntu and windows,
+lint through the tools module (`go tool -modfile=tools/go.mod golangci-lint run`, the same binary
+`make audit` uses — a bare `golangci-lint` on PATH may be the wrong major version), and the full
+browser suite via `make test/e2e`. The e2e job gates merges on purpose: it is the only layer that
+catches morph/popover/IntersectionObserver breaks, and it has caught ones the unit suite waved
+through.
 
 ## Commands
 

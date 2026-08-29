@@ -352,6 +352,22 @@ func (h *Handler) Close(sid string) bool {
 	return true
 }
 
+// Shutdown ends every session and waits for their teardowns - components
+// unmounted, subscriptions and timers stopped, streams closed - bounded by
+// ctx. After it returns the handler starts no new sessions: a page load
+// answers 503, and a connected page's stream ends, reconnects into
+// tellToReload, and comes back once a new process is listening. That reload
+// is the whole hand-off story, the same one a deploy already relies on.
+//
+// Call it after your http.Server's own Shutdown, the way its docs order
+// Close after Shutdown: the server first stops accepting and drains
+// requests, then this releases what the pages were holding. On a ctx that
+// expires the sweep keeps running; only the waiting stops, and the error is
+// ctx's.
+func (h *Handler) Shutdown(ctx context.Context) error {
+	return h.sessions.closeAll(ctx)
+}
+
 // CloseOwner ends every session labelled owner by [Session.SetOwner], and
 // returns how many. It is what logging out calls: one person can have the
 // same page open in four tabs, and each is its own session.
@@ -468,7 +484,7 @@ func (h *Handler) originOK(r *http.Request) bool {
 // the one place that must never end up. The log still gets all of it.
 var refusals = []error{
 	ErrNoSession, ErrNoAction, ErrNoUpload, ErrNoFiles,
-	ErrTooManyFiles, ErrFileTooLarge, ErrFileType, ErrAlreadyAttached,
+	ErrTooManyFiles, ErrFileTooLarge, ErrFileType,
 	ErrTooManySessions, errBadSignals,
 }
 

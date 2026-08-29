@@ -2,6 +2,7 @@ package shuttle
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -580,6 +581,9 @@ func (s *Session) mounted(n *node) bool {
 // this slice for the whole grace window, at whatever rate it produces.
 const maxPendingOps = 1024
 
+// errOpsBacklog reports the drop above to the handler's logger.
+var errOpsBacklog = errors.New("shuttle: stream operation backlog full, dropping oldest")
+
 // enqueue adds a stream operation.
 //
 // Ordered rather than coalesced, unlike a component's re-render: two
@@ -604,7 +608,7 @@ func (s *Session) enqueue(p patch) error {
 
 	if dropped {
 		// Reported outside the lock - onError is application code.
-		s.fail("stream", fmt.Errorf("operation backlog past %d, dropping oldest", maxPendingOps))
+		s.fail("stream", errOpsBacklog)
 	}
 
 	select {
@@ -748,22 +752,19 @@ func (s *Session) stream(sse *datastar.ServerSentEventGenerator, heartbeat time.
 	}
 }
 
-// close tears the session down, unmounting the whole tree and stopping its
-// subscriptions and timers. Idempotent, and it waits for the teardown to
-// finish. Never call it from the session's own goroutine - registry timers,
-// requests and tests are its callers, and from any of those waiting is
-// safe.
+// beginClose marks the session closed and queues its teardown behind
+// whatever is already in flight. It does not wait, so it is safe from any
+// goroutine - including the session's own, which is what lets an action
+// end its own session through Handler.Close.
 //
-// The teardown itself runs on the session's goroutine, queued behind
-// whatever is already in flight. Running it on the caller's goroutine - the
-// previous shape - raced Unmount and the cleanup funcs against an action
-// mid-execution, which breaks the one rule every component is written
-// against.
-func (s *Session) close(ctx context.Context) {
+// The teardown itself runs on the session's goroutine. Running it on the
+// caller's - the previous shape - raced Unmount and the cleanup funcs
+// against an action mid-execution, which breaks the one rule every
+// component is written against.
+func (s *Session) beginClose(ctx context.Context) {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
-		<-s.done
 		return
 	}
 	s.closed = true
@@ -771,7 +772,7 @@ func (s *Session) close(ctx context.Context) {
 	// session: this is the one item that must still run.
 	s.mailbox = append(s.mailbox, func() {
 		// Deferred so a panicking Unmount cannot leave done open, the run
-		// loop spinning, and close's caller waiting forever.
+		// loop spinning, and a close waiter waiting forever.
 		defer close(s.done)
 		// Every component's own teardown - its subscriptions, timers and
 		// presence - runs as the tree unmounts, so there is nothing
@@ -784,5 +785,12 @@ func (s *Session) close(ctx context.Context) {
 	case s.work <- struct{}{}:
 	default:
 	}
+}
+
+// close is beginClose plus the wait for the teardown to finish. Never call
+// it from the session's own goroutine - shutdown and tests are its callers,
+// and from those waiting is both safe and the point.
+func (s *Session) close(ctx context.Context) {
+	s.beginClose(ctx)
 	<-s.done
 }

@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  TAILWIND_VERSION: v4.0.17
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: go build ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # version comes from the tools module's tool directive — same as
+      # `make audit` locally
+      - run: go tool -modfile=tools/go.mod golangci-lint run ./...
+
+  # The browser suite is the only thing that can catch this codebase's worst
+  # class of bug: behaviour that every unit test models and only a real morph,
+  # popover or IntersectionObserver exhibits. It has caught breaks the unit
+  # suite waved through, so it gates merges rather than running on faith.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: install tailwindcss
+        run: |
+          curl -sfL -o /usr/local/bin/tailwindcss \
+            "https://github.com/tailwindlabs/tailwindcss/releases/download/${TAILWIND_VERSION}/tailwindcss-linux-x64"
+          chmod +x /usr/local/bin/tailwindcss
+      - run: make test/e2e
