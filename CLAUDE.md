@@ -734,6 +734,18 @@ successes still count as proof of life whatever started them. `TestConnectionSta
 passes, which is the check that mattered, because the failure mode of getting this wrong is a page
 that silently stops reporting real disconnections.
 
+**CSP is `Handler.Nonce`, and the stream half is the part to remember.** The app's middleware
+mints the per-request nonce and the hook reads it back; shuttle stamps the inline shim, the
+Datastar module tag and `Page.Nonce` for custom shells. The non-obvious half: scripts the stream
+injects later - navigation's history calls, redirects, `tellToReload` - must carry the nonce of
+the page they land in, so the session remembers it for its whole life, and the reload path (which
+has no session by definition) gets it back via the `Shuttle-Nonce` header the attach expression
+sends. Both the hook's value and that header are validated against `nonceRE` - one alphabet, one
+length cap - before becoming markup, because escaping a value with exactly one legitimate shape is
+the wrong tool. A nonce cannot fix `'unsafe-eval'`: Datastar compiles `data-*` expressions with
+the Function constructor (verified in the v1.0.2 bundle), so that stays in `script-src` either
+way. `TestNonceReachesEveryScript` and `TestNonceIsValidatedBeforeItIsMarkup` pin all of it.
+
 **Logging out needs `Handler.Close`/`CloseOwner`.** A session outlives the request that made it,
 holding the identity it captured at mount, and nothing about a cookie expiring reaches it. The
 recovery path needed no new machinery: closing ends the stream, the client reconnects, the registry

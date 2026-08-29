@@ -447,6 +447,32 @@ closes, `Handler.Grace` later evicts the session, and returning to that tab relo
 loses what it held. Trading that away to reclaim a connection is only reasonable on HTTP/1.1 with
 `Grace` raised to cover how long a tab might sit in the background.
 
+## Content-Security-Policy
+
+Shuttle needs two things from a page's `script-src`, and `Handler.Nonce` is how it gets the first
+without `'unsafe-inline'`. Your middleware mints a nonce per request, puts it in the CSP header,
+and hands it back through the hook:
+
+```go
+handler.Nonce = func(r *http.Request) string {
+    return nonceFromContext(r.Context()) // whatever your CSP middleware stashed
+}
+```
+
+Shuttle stamps it on the inline shim and on the Datastar module tag (a nonce admits an external
+script the same way it admits an inline one, so the CDN needs no allow-listing), exposes it as
+`Page.Nonce` for a custom `Shell`'s own tags, and — the half that is easy to miss — carries it on
+every script the session's stream injects afterwards: navigation's history calls, redirects, the
+reload sent to a page whose session is gone. Those arrive long after the page response, and a
+dynamically inserted script passes CSP by carrying the nonce of the page it lands in.
+
+The second thing has no workaround: Datastar compiles its `data-*` expressions with the `Function`
+constructor, so `script-src` needs `'unsafe-eval'` regardless. The working policy is:
+
+```
+script-src 'nonce-<per-request>' 'unsafe-eval'
+```
+
 ## One node is the supported deployment
 
 Sessions live in one process's memory and never migrate — the component tree is closures over live

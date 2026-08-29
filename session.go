@@ -37,6 +37,11 @@ type Session struct {
 	// one, and the component reading it is how a single session can be a
 	// whole site.
 	urlPath string
+	// nonce is the page's CSP nonce, when the handler's Nonce hook supplied
+	// one. Scripts this session's stream injects carry it for the page's
+	// whole life - a dynamically inserted script passes CSP by carrying the
+	// nonce of the page it lands in. Guarded by mu.
+	nonce string
 
 	// onError reports failures raised on the session's own goroutine, where
 	// there is no request to return them to. Set by the handler.
@@ -417,6 +422,13 @@ func (s *Session) presence() *presence { return s.pres }
 // Broker returns the pub/sub backend this session publishes through.
 func (s *Session) Broker() Broker { return s.broker }
 
+// pageNonce is the CSP nonce the page was served with, or "".
+func (s *Session) pageNonce() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.nonce
+}
+
 // currentURL is where the server believes the address bar points.
 func (s *Session) currentURL() string {
 	s.mu.Lock()
@@ -715,6 +727,14 @@ func (s *Session) stream(sse *datastar.ServerSentEventGenerator, heartbeat time.
 		beat = t.C
 	}
 
+	// Scripts injected into a page pass a nonce-based CSP by carrying the
+	// nonce that page was served with; without it, navigation and redirects
+	// silently stop working the day the app tightens script-src.
+	var scriptOpts []datastar.ExecuteScriptOption
+	if n := s.pageNonce(); n != "" {
+		scriptOpts = append(scriptOpts, datastar.WithExecuteScriptAttributeKVs("nonce", n))
+	}
+
 	// Say hello before waiting for anything to say. The client cannot tell a
 	// live stream from a stalled one until bytes arrive, so a page that has
 	// just reconnected goes on showing "connection lost" over a connection
@@ -735,7 +755,7 @@ func (s *Session) stream(sse *datastar.ServerSentEventGenerator, heartbeat time.
 			var err error
 			switch {
 			case p.script != "":
-				err = sse.ExecuteScript(p.script)
+				err = sse.ExecuteScript(p.script, scriptOpts...)
 			case p.signals != "":
 				err = sse.PatchSignals([]byte(p.signals))
 			case p.mode == datastar.ElementPatchModeRemove:

@@ -38,11 +38,13 @@ import (
 //go:embed shim.js
 var shimSource string
 
-// clientScript renders the shim for one session.
+// clientScript renders the shim for one session. nonce, when set, is the
+// page's CSP nonce - already validated by the handler, and required on this
+// tag for any script-src without 'unsafe-inline'.
 //
 // type="module" is not decoration: it is what keeps shuttleShim out of the
 // global scope, so a page carrying this script gains no names of its own.
-func clientScript(s *Session) string {
+func clientScript(s *Session, nonce string) string {
 	base := s.prefix + routePrefix
 	nav, err := json.Marshal(base + "/nav")
 	if err != nil {
@@ -67,7 +69,13 @@ func clientScript(s *Session) string {
 	}
 
 	var b strings.Builder
-	b.WriteString("<script type=\"module\">\n")
+	b.WriteString("<script type=\"module\"")
+	if nonce != "" {
+		b.WriteString(" nonce=\"")
+		b.WriteString(nonce)
+		b.WriteString("\"")
+	}
+	b.WriteString(">\n")
 	b.WriteString(shimSource)
 	b.WriteString("\nshuttleShim({nav: ")
 	b.Write(nav)

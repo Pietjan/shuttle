@@ -11,6 +11,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -140,6 +141,23 @@ type Handler struct {
 	// deliberately. At the server root it would mint a session for every
 	// stray GET.
 	Subtree bool
+
+	// Nonce supplies the CSP nonce for a page request, when the app runs a
+	// Content-Security-Policy that forbids 'unsafe-inline'. Return the same
+	// value your middleware put in this response's CSP header - typically
+	// read back out of the request context - and shuttle stamps it on the
+	// inline shim, exposes it as Page.Nonce for a custom Shell's own tags,
+	// and carries it on every script the session's stream later injects:
+	// navigation's history calls, redirects, and the reload sent to a page
+	// whose session is gone. Those arrive long after this response, and a
+	// dynamically inserted script passes CSP by carrying the nonce of the
+	// page it lands in - which is exactly this one.
+	//
+	// Nil means no nonce anywhere, which is right for a page with no CSP.
+	// One thing a nonce cannot fix: Datastar compiles its data-* expressions
+	// with the Function constructor, so script-src needs 'unsafe-eval'
+	// alongside the nonce either way.
+	Nonce func(r *http.Request) string
 
 	// CheckOrigin decides whether a request that changes something may
 	// proceed. Nil compares the Origin header's host against the request's
@@ -271,6 +289,11 @@ type Page struct {
 	// reports the back and forward buttons, which the server has no other
 	// way to see. Write it into the document, or lose those buttons.
 	Scripts string
+
+	// Nonce is what Handler.Nonce returned for this request, or "". Scripts
+	// already carries it; a custom Shell stamps it on its own script tags -
+	// including the Datastar module - the way DefaultShell does.
+	Nonce string
 }
 
 // New returns a Handler serving component instances produced by factory.
@@ -528,6 +551,13 @@ func publicMessage(status int, err error) string {
 // attacker knows.
 const SessionHeader = "Shuttle-Session"
 
+// NonceHeader carries the page's CSP nonce on the requests Datastar makes,
+// so a stream request that finds no session - a restarted server - can
+// still stamp its reload script with the nonce of the page that asked. It
+// is client-controlled input like any header: validated before use, never
+// echoed raw.
+const NonceHeader = "Shuttle-Nonce"
+
 // sessionHeaderExpr is the headers option every request datastar makes on
 // this session's behalf carries. Datastar merges it over its own defaults,
 // for a GET stream as readily as for a POST.
@@ -537,7 +567,33 @@ const SessionHeader = "Shuttle-Session"
 // %q on the way in, so the day that stops being true this breaks loudly
 // rather than quietly emitting a broken attribute.
 func sessionHeaderExpr(s *Session) string {
+	if n := s.pageNonce(); n != "" {
+		return fmt.Sprintf(`{%q: %q, %q: %q}`, SessionHeader, s.ID(), NonceHeader, n)
+	}
 	return fmt.Sprintf(`{%q: %q}`, SessionHeader, s.ID())
+}
+
+// nonceRE is the shape a CSP nonce can take - base64 and base64url. It
+// gates both the Nonce hook's output and the NonceHeader echo, because a
+// nonce becomes an attribute value inside markup and inside scripts the
+// stream injects, and "validate to a tight shape" beats escaping for a
+// value that has exactly one legitimate alphabet.
+var nonceRE = regexp.MustCompile(`^[A-Za-z0-9+/_-]{1,255}={0,2}$`)
+
+// nonce resolves the page's CSP nonce for a request, or "".
+func (h *Handler) nonce(r *http.Request) string {
+	if h.Nonce == nil {
+		return ""
+	}
+	n := h.Nonce(r)
+	if n == "" {
+		return ""
+	}
+	if !nonceRE.MatchString(n) {
+		h.log().Error("shuttle: Nonce returned a value that is not a CSP nonce; ignoring it")
+		return ""
+	}
+	return n
 }
 
 // sessionOf returns the session a transport request names, or false. The id
@@ -603,9 +659,11 @@ func (h *Handler) servePage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
+	nonce := h.nonce(r)
 	// Locked: the session's goroutine is already running, and these fields
 	// are read from it.
 	sess.mu.Lock()
+	sess.nonce = nonce
 	sess.params = Params(r.URL.Query())
 	sess.prefix = strings.TrimSuffix(h.Prefix, "/")
 
@@ -668,7 +726,8 @@ func (h *Handler) servePage(w http.ResponseWriter, r *http.Request) {
 		ScriptURL: h.ScriptURL,
 		Attach:    attachExpr(sess, h.openWhenHidden()),
 		Body:      body,
-		Scripts:   clientScript(sess),
+		Scripts:   clientScript(sess, nonce),
+		Nonce:     nonce,
 	}
 	if err := shell(w, page); err != nil {
 		h.log().Error("shuttle: writing page failed", "err", err)
@@ -679,13 +738,20 @@ func (h *Handler) servePage(w http.ResponseWriter, r *http.Request) {
 // DefaultShell writes a minimal document: the Datastar module, whatever
 // Head carries, and the component inside a body that opens the stream.
 func DefaultShell(w io.Writer, p Page) error {
+	// A nonce admits an external script under a nonce-based CSP the same
+	// way it admits an inline one, which is what lets the Datastar module
+	// through without allow-listing its CDN.
+	nonceAttr := ""
+	if p.Nonce != "" {
+		nonceAttr = fmt.Sprintf(` nonce=%q`, p.Nonce)
+	}
 	_, err := fmt.Fprintf(w, `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>%s</title>
-<script type="module" src="%s"></script>
+<script type="module" src="%s"%s></script>
 %s%s</head>
 <body data-init="%s">
 %s
@@ -694,6 +760,7 @@ func DefaultShell(w io.Writer, p Page) error {
 `,
 		html.EscapeString(p.Title),
 		html.EscapeString(p.ScriptURL),
+		nonceAttr,
 		p.Head,
 		p.Scripts,
 		html.EscapeString(p.Attach),
@@ -787,9 +854,19 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) tellToReload(w http.ResponseWriter, r *http.Request) {
 	h.stats.reloads.Add(1)
 	sse := datastar.NewSSE(w, r)
+	// The page's nonce arrives as a header, because this is the one script
+	// the server sends with no session to remember it on - the session is
+	// exactly what is gone. Client-controlled input: it is validated to the
+	// one shape a nonce can take, and dropped otherwise. A wrong nonce
+	// costs the sender nothing (its own page just refuses the script), so
+	// there is nothing here to forge for.
+	var opts []datastar.ExecuteScriptOption
+	if n := r.Header.Get(NonceHeader); n != "" && nonceRE.MatchString(n) {
+		opts = append(opts, datastar.WithExecuteScriptAttributeKVs("nonce", n))
+	}
 	// A beat of delay, so a server that is failing every request cannot turn
 	// this into a reload loop running as fast as the network allows.
-	if err := sse.ExecuteScript(`setTimeout(() => location.reload(), 1000)`); err != nil {
+	if err := sse.ExecuteScript(`setTimeout(() => location.reload(), 1000)`, opts...); err != nil {
 		h.log().Debug("shuttle: could not send a reload", "err", err)
 	}
 }
