@@ -168,7 +168,7 @@ func TestStreamReplaceAndRemoveAddressTheItem(t *testing.T) {
 		target, mode string
 	}{
 		{"shuttle-c-log", "append"},
-		{"shuttle-c-log-1", "outer"},
+		{"shuttle-c-log-1", "replace"},
 		{"shuttle-c-log-1", "remove"},
 		{"shuttle-c-log", "inner"},
 	} {

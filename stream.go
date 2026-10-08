@@ -96,6 +96,11 @@ func (s *Stream) Prepend(ctx context.Context, key string, c templ.Component) err
 
 // Replace re-renders one item in place, leaving the rest of the collection
 // untouched.
+//
+// It swaps the element rather than morphing it (Datastar's "replace" mode,
+// not "outer"), because the morph skips anything inside a
+// data-ignore-morph container - which is exactly where a streamed item
+// lives - and an outer patch there is a silent no-op.
 func (s *Stream) Replace(ctx context.Context, key string, c templ.Component) error {
 	html, err := s.item(ctx, key, c)
 	if err != nil {
@@ -104,7 +109,7 @@ func (s *Stream) Replace(ctx context.Context, key string, c templ.Component) err
 	return s.send(patch{
 		target: s.ItemID(key),
 		html:   html,
-		mode:   datastar.ElementPatchModeOuter,
+		mode:   datastar.ElementPatchModeReplace,
 	})
 }
 
