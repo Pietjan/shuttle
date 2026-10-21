@@ -3,7 +3,9 @@ package shuttle
 import (
 	_ "embed"
 	"encoding/json"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // The client shim is the only JavaScript shuttle ships, and it exists for
@@ -40,11 +42,12 @@ var shimSource string
 
 // clientScript renders the shim for one session. nonce, when set, is the
 // page's CSP nonce - already validated by the handler, and required on this
-// tag for any script-src without 'unsafe-inline'.
+// tag for any script-src without 'unsafe-inline'. heartbeat is the stream's,
+// which the shim's stall watchdog measures silence against.
 //
 // type="module" is not decoration: it is what keeps shuttleShim out of the
 // global scope, so a page carrying this script gains no names of its own.
-func clientScript(s *Session, nonce string) string {
+func clientScript(s *Session, nonce string, heartbeat time.Duration) string {
 	base := s.prefix + routePrefix
 	nav, err := json.Marshal(base + "/nav")
 	if err != nil {
@@ -85,6 +88,8 @@ func clientScript(s *Session, nonce string) string {
 	b.Write(sid)
 	b.WriteString(", header: ")
 	b.Write(header)
+	b.WriteString(", heartbeat: ")
+	b.WriteString(strconv.FormatInt(max(heartbeat, 0).Milliseconds(), 10))
 	b.WriteString("});\n</script>\n")
 	return b.String()
 }

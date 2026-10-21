@@ -6,8 +6,9 @@
 // nav is the navigation endpoint; up is the session-free health check. sid
 // is this page's session and header is the name it travels under - the same
 // header Datastar's own requests carry, because the id is a capability and
-// a URL is the most copied string in a system.
-function shuttleShim({ nav, up, sid, header }) {
+// a URL is the most copied string in a system. heartbeat is how often, in
+// milliseconds, an idle stream writes; 0 when it does not.
+function shuttleShim({ nav, up, sid, header, heartbeat }) {
   const root = document.documentElement;
 
   // Spelled out rather than built, so an app can grep for the class it
@@ -40,19 +41,55 @@ function shuttleShim({ nav, up, sid, header }) {
   // lost" over a stream that is working. A success is proof either way.
   const fromStream = (el) => el instanceof Element && el.matches('[data-init]');
 
+  // A stream can stop delivering without failing. Chrome freezes a page it
+  // has hidden for a while - Edge's sleeping tabs are the same thing - and
+  // stops reading its streams; past half a minute or so, on Windows, the
+  // stream can come back delivering nothing at all, with no error and no
+  // end. Datastar retries only on an error or a close, and this shim only
+  // hears what Datastar tells it, so the page stays 'connected' while every
+  // action's re-render goes down a stream nobody reads. Measured on
+  // 2026-10-21: a map modal whose close button stopped working once its tab
+  // had sat in the background.
+  //
+  // Two ways out, both reopening the stream. The browser says when it thaws
+  // a page, with 'resume'. And the server writes at least every heartbeat,
+  // so a stream silent for well over one is not idle but stalled - which
+  // also covers a stall nothing announces, a laptop waking from sleep. The
+  // server keeps the session across the reopen and re-renders the page down
+  // the new stream, since it cannot know what the old one delivered.
+  let heard = Date.now();
+  const reopen = () => {
+    const el = document.body;
+    const init = el && el.getAttribute('data-init');
+    if (!init) return;
+    heard = Date.now();
+    // Datastar runs data-init when the attribute is initialised, and
+    // removing it cleans up after it - the fetch it opened is aborted. Put
+    // back on the next task, so the two are seen as two changes.
+    el.removeAttribute('data-init');
+    setTimeout(() => el.setAttribute('data-init', init), 0);
+  };
+  document.addEventListener('resume', reopen);
+  if (heartbeat > 0) {
+    setInterval(() => {
+      if (root.dataset.shuttleState === 'connected' && Date.now() - heard > heartbeat * 2.5) reopen();
+    }, heartbeat);
+  }
+
   document.addEventListener('datastar-fetch', (e) => {
     const d = e.detail || {};
 
     if (String(d.type).startsWith('datastar-patch-')) {
       // A patch can only have come down the stream, so it is proof the
       // stream is alive - whatever request delivered it.
+      heard = Date.now();
       set('connected');
     } else if (d.type === 'started') {
       // 'started' is only the request going out, so it proves nothing
       // about the stream unless it IS the stream: an action's fetch
       // starting must not paint a dead page 'connected' while the probe
       // below is still the only way back.
-      if (fromStream(d.el)) set('connected');
+      if (fromStream(d.el)) { heard = Date.now(); set('connected'); }
     } else if (d.type === 'error' || d.type === 'retrying') {
       if (fromStream(d.el)) set('reconnecting');
     } else if (d.type === 'retries-failed' && fromStream(d.el)) {

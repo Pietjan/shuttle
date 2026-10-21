@@ -726,7 +726,7 @@ func (h *Handler) servePage(w http.ResponseWriter, r *http.Request) {
 		ScriptURL: h.ScriptURL,
 		Attach:    attachExpr(sess, h.openWhenHidden()),
 		Body:      body,
-		Scripts:   clientScript(sess, nonce),
+		Scripts:   clientScript(sess, nonce, h.heartbeat()),
 		Nonce:     nonce,
 	}
 	if err := shell(w, page); err != nil {
@@ -839,7 +839,7 @@ func (h *Handler) serveStream(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	sse := datastar.NewSSE(w, r.WithContext(ctx))
-	if err := sess.stream(sse, h.heartbeat()); err != nil {
+	if err := sess.stream(sse, h.heartbeat(), slot); err != nil {
 		h.log().Debug("shuttle: stream ended", "session", sess.Tag(), "err", err)
 	}
 }

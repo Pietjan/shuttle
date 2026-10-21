@@ -862,7 +862,7 @@ configurable for a deployment that does make that trade. **HTTP/2 is the fix; no
 It is a real `.js` file, `//go:embed`ed by `shim.go` — so it is JavaScript to an editor, a
 formatter and a linter, and nothing in it is escaped for Go's sake (the old string template needed
 a doubled `%%` for one CSS percentage). What varies per session is one generated call appended
-after it, `shuttleShim({nav, up})`, inside a `type="module"` script — which is what keeps the
+after it, `shuttleShim({nav, up, sid, header, heartbeat})`, inside a `type="module"` script — which is what keeps the
 function itself out of the global scope, so a page carrying the shim gains no names of its own.
 
 Three things about Datastar's `datastar-fetch` event were verified in a browser rather than
@@ -904,6 +904,27 @@ that had just reconnected went on showing "connection lost" over a working conne
 heartbeat: **up to 25 seconds**. The e2e test found it by waiting 20s and failing, then passing at
 27. Unconditional because it is proof of life rather than a heartbeat, so `Heartbeat = -1` does not
 turn it off — and it gets bytes past an intermediary that would otherwise sit on the response.
+
+**A stream can stall without failing, and the shim reopens it.** Chrome freezes a hidden tab after a
+while (Edge's sleeping tabs are the same) and stops reading its streams; on Windows Chrome a stream
+frozen for over ~30 s came back delivering nothing, with no error and no end — the server's writes
+still succeed into the socket, Datastar's retry needs an error or a close, so the page stayed
+`connected` while every re-render went down a stream nobody read (found as valheim-world's map
+modal refusing to close after its tab sat in the background, 2026-10-21; 15 s recovered, 35 s did
+not). The playwright Chromium does not reproduce it by freezing, so `e2e/freeze_test.go` mutes the
+open streams in the harness instead — writes accepted and dropped, the same state. Two triggers,
+both re-initialising `<body data-init>` (removing the attribute aborts the fetch, putting it back
+opens a new one): the browser's `resume` event, fired on thaw; and a watchdog — the heartbeat is now
+passed to the shim (`shuttleShim({…, heartbeat})`), and a `connected` page that has heard nothing
+for 2½ heartbeats reopens. `TestAResumedPageReopensItsStream`, `TestAStalledStreamIsReopened`.
+
+**Every stream after the first re-sends the whole page.** A patch the previous stream took is off
+the queue whether or not it arrived — a dropped connection loses it just the same — so `attach`
+marks the root dirty for any stream but the session's first, and clears `sent`, without which the
+identical render is dropped by the dedupe as already there. Two races came with it: a displaced
+stream's goroutine waits on the same wake as its successor and could take the re-render meant for
+it, so `takeFor(slot)` only hands patches to the current holder (checked under the take's own
+lock), and a displaced stream that consumed a wake passes it on. `TestAReopenedStreamGetsThePage`.
 
 ### Testing kit
 

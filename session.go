@@ -90,7 +90,11 @@ type Session struct {
 	// rather than a bool so a displaced stream's teardown cannot release a
 	// slot that a takeover already owns.
 	holder *streamSlot
-	closed bool
+	// streamed is whether a stream has ever attached. The first one starts
+	// from the page the GET served; any later one starts from a page that
+	// lost whatever the stream before it took and never delivered.
+	streamed bool
+	closed   bool
 
 	// dirty holds components needing a re-render. Marking rather than
 	// queueing renders is what makes Push safe to call from anywhere: the
@@ -520,10 +524,26 @@ func (s *Session) queue(elementID, html string) error {
 // converges either way, but patching a child into a subtree its parent is
 // about to replace is wasted work.
 func (s *Session) take() []patch {
+	out, _ := s.takeFor(nil)
+	return out
+}
+
+// takeFor is take for the stream holding slot, checked under the same lock
+// the patches are taken under, and reports false - taking nothing - to a
+// stream that no longer holds it. A displaced stream's goroutine runs on
+// until it sees its cancel, and the wake it waits on is the one its
+// successor waits on; without the check it could take the very re-render
+// attach queued for the new stream and write it down the dead one. A nil
+// slot takes for whoever asks, which is what the testing kit wants.
+func (s *Session) takeFor(slot *streamSlot) ([]patch, bool) {
 	s.mu.Lock()
+	if slot != nil && s.holder != slot {
+		s.mu.Unlock()
+		return nil, false
+	}
 	if len(s.pending) == 0 && len(s.ops) == 0 {
 		s.mu.Unlock()
-		return nil
+		return nil, true
 	}
 
 	ids := make([]string, 0, len(s.pending))
@@ -564,7 +584,7 @@ func (s *Session) take() []patch {
 		n.walk((*node).markSent)
 	}
 
-	return out
+	return out, true
 }
 
 // markTreeSent records that every mounted component's current markup has
@@ -675,6 +695,12 @@ type streamSlot struct {
 // The session id is a capability, so a second holder of it is almost
 // always the same client's newer attempt; the newest attempt wins, and the
 // displaced stream is cancelled so its goroutine ends rather than lingers.
+//
+// Every stream after the first re-renders the whole page down itself. A
+// patch the stream before it took is gone from the queue whether or not it
+// reached the page - a connection that dropped mid-write, or one a frozen
+// tab stopped reading - and nothing on this side can tell which, so the
+// page is brought up to date rather than left showing what it last got.
 func (s *Session) attach(cancel context.CancelFunc) (*streamSlot, error) {
 	s.mu.Lock()
 	if s.closed {
@@ -684,7 +710,19 @@ func (s *Session) attach(cancel context.CancelFunc) (*streamSlot, error) {
 	old := s.holder
 	slot := &streamSlot{cancel: cancel}
 	s.holder = slot
+	resumed := s.streamed
+	s.streamed = true
+	if resumed {
+		// What was sent went down the old stream, so it is not known to
+		// have arrived; forgetting it is what lets the identical render
+		// below go out instead of being dropped as already there.
+		clear(s.sent)
+	}
 	s.mu.Unlock()
+
+	if resumed {
+		_ = s.markDirty(s.root)
+	}
 
 	if old != nil {
 		s.stats.takeovers.Add(1)
@@ -719,7 +757,7 @@ func (s *Session) detach(slot *streamSlot) bool {
 // stream writes pending renders to the page until the connection or the
 // session ends. It is the session's only writer, which is what gives
 // patches a total order - separate one-shot requests have none.
-func (s *Session) stream(sse *datastar.ServerSentEventGenerator, heartbeat time.Duration) error {
+func (s *Session) stream(sse *datastar.ServerSentEventGenerator, heartbeat time.Duration, slot *streamSlot) error {
 	var beat <-chan time.Time
 	if heartbeat > 0 {
 		t := time.NewTicker(heartbeat)
@@ -751,7 +789,17 @@ func (s *Session) stream(sse *datastar.ServerSentEventGenerator, heartbeat time.
 	for {
 		// Drain first: a render may already be waiting from before the
 		// stream attached, or from the reconnect gap.
-		for _, p := range s.take() {
+		patches, held := s.takeFor(slot)
+		if !held {
+			// Displaced. The wake that brought this stream here may have
+			// been meant for the one that displaced it, so pass it on.
+			select {
+			case s.wake <- struct{}{}:
+			default:
+			}
+			return nil
+		}
+		for _, p := range patches {
 			var err error
 			switch {
 			case p.script != "":

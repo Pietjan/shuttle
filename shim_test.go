@@ -1,6 +1,7 @@
 package shuttle
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -191,5 +192,63 @@ func TestStreamGreetsOnConnect(t *testing.T) {
 	// And then it goes quiet, because the heartbeat is off.
 	if !stream.silent(200 * time.Millisecond) {
 		t.Error("the stream kept writing with the heartbeat disabled")
+	}
+}
+
+// TestAReopenedStreamGetsThePage. A stream the page reopens - after a drop,
+// or because the shim found it stalled - must not start from silence: the
+// stream before it took patches off the queue that may never have reached
+// the page, a frozen tab's stream most of all, and nothing here can tell
+// which did. So the first stream starts from the page the GET served, and
+// every later one is handed the whole page again.
+func TestAReopenedStreamGetsThePage(t *testing.T) {
+	h := New(func() Component { return &counter{} })
+	h.Logger = quietLogger()
+	h.Heartbeat = -1
+	srv := httptest.NewTestServer(t, h)
+	t.Cleanup(srv.Close)
+
+	_, sid := getPage(t, srv)
+	open := func() *sseReader {
+		req, err := http.NewRequest(http.MethodGet, srv.URL+routePrefix+"/live", nil)
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		req.Header.Set(SessionHeader, sid)
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatalf("open stream: %v", err)
+		}
+		t.Cleanup(func() { resp.Body.Close() })
+		stream := newSSEReader(resp.Body)
+		t.Cleanup(stream.close)
+		if evt := stream.event(t); !strings.Contains(evt, "datastar-patch-signals") {
+			t.Fatalf("a stream opened with %q, want the greeting", evt)
+		}
+		return stream
+	}
+
+	first := open()
+	if !first.silent(200 * time.Millisecond) {
+		t.Error("the first stream re-sent the page the GET had just served")
+	}
+
+	// A render that goes down the first stream, so the session holds it as
+	// sent: the page the second stream must re-send is byte for byte what
+	// the first one took, which is exactly what the dedupe would drop.
+	sess, ok := h.sessions.get(sid)
+	if !ok {
+		t.Fatal("no session")
+	}
+	if err := sess.call(context.Background(), func() error { return sess.Push(context.Background()) }); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+	if evt := first.event(t); !strings.Contains(evt, "datastar-patch-elements") {
+		t.Fatalf("the first stream got %q, want the pushed render", evt)
+	}
+
+	second := open()
+	if evt := second.event(t); !strings.Contains(evt, "datastar-patch-elements") {
+		t.Errorf("a reopened stream's first patch is %q, want the page", evt)
 	}
 }
